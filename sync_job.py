@@ -38,10 +38,9 @@ def log_message(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 # ─── Turso Database Helpers ─────────────────────────────────────
-async def execute_sql(sql: str, args: list = None) -> list:
-    args = args or []
+def _make_turso_args(args: list) -> list:
     turso_args = []
-    for arg in args:
+    for arg in (args or []):
         if arg is None:
             turso_args.append({"type": "null"})
         elif isinstance(arg, int):
@@ -50,10 +49,32 @@ async def execute_sql(sql: str, args: list = None) -> list:
             turso_args.append({"type": "float", "value": arg})
         else:
             turso_args.append({"type": "text", "value": str(arg)})
+    return turso_args
 
+def _parse_turso_result(exec_result: dict) -> list:
+    cols = [col["name"] for col in exec_result.get("cols", [])]
+    rows = exec_result.get("rows", [])
+    parsed_rows = []
+    for row in rows:
+        row_dict = {}
+        for i, cell in enumerate(row):
+            val_type = cell.get("type")
+            val = cell.get("value")
+            if val_type == "null":
+                row_dict[cols[i]] = None
+            elif val_type == "integer":
+                row_dict[cols[i]] = int(val)
+            elif val_type == "float":
+                row_dict[cols[i]] = float(val)
+            else:
+                row_dict[cols[i]] = str(val)
+        parsed_rows.append(row_dict)
+    return parsed_rows
+
+async def execute_sql(sql: str, args: list = None) -> list:
     body = {
         "requests": [
-            {"type": "execute", "stmt": {"sql": sql, "args": turso_args}},
+            {"type": "execute", "stmt": {"sql": sql, "args": _make_turso_args(args)}},
             {"type": "close"}
         ]
     }
@@ -65,24 +86,33 @@ async def execute_sql(sql: str, args: list = None) -> list:
             return []
         res = r.json()
         exec_result = res["results"][0]["response"]["result"]
-        cols = [col["name"] for col in exec_result.get("cols", [])]
-        rows = exec_result.get("rows", [])
-        parsed_rows = []
-        for row in rows:
-            row_dict = {}
-            for i, cell in enumerate(row):
-                val_type = cell.get("type")
-                val = cell.get("value")
-                if val_type == "null":
-                    row_dict[cols[i]] = None
-                elif val_type == "integer":
-                    row_dict[cols[i]] = int(val)
-                elif val_type == "float":
-                    row_dict[cols[i]] = float(val)
-                else:
-                    row_dict[cols[i]] = str(val)
-            parsed_rows.append(row_dict)
-        return parsed_rows
+        return _parse_turso_result(exec_result)
+
+async def execute_sql_batch(statements: list) -> list:
+    """Execute multiple SQL statements in a single HTTP request.
+    statements: list of (sql, args) tuples.
+    Returns list of results for each statement."""
+    if not statements:
+        return []
+    requests = []
+    for sql, args in statements:
+        requests.append({"type": "execute", "stmt": {"sql": sql, "args": _make_turso_args(args)}})
+    requests.append({"type": "close"})
+
+    headers = {"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(f"{TURSO_URL}/v2/pipeline", headers=headers, json={"requests": requests})
+        if r.status_code != 200:
+            log_message(f"Turso batch SQL error ({r.status_code}): {r.text}")
+            return []
+        res = r.json()
+        results = []
+        for i, result_obj in enumerate(res.get("results", [])):
+            resp = result_obj.get("response", {})
+            if resp.get("type") == "execute":
+                results.append(_parse_turso_result(resp.get("result", {})))
+            # skip "close" responses
+        return results
 
 # ─── Title & Episode Parsing Functions ─────────────────────────
 def clean_title(title: str) -> str:
@@ -578,6 +608,8 @@ async def sync_anilist_schedule():
                 if not schedules:
                     break
 
+                # Batch all upserts for this page into a single Turso HTTP call
+                batch_stmts = []
                 for item in schedules:
                     ep_num = item["episode"]
                     airing_ts = item["airingAt"]
@@ -593,8 +625,7 @@ async def sync_anilist_schedule():
                     genres = json.dumps(m.get("genres") or [])
                     format_type = m.get("format") or "TV"
 
-                    # 1. Insert or Update anime
-                    await execute_sql("""
+                    batch_stmts.append(("""
                         INSERT INTO anime (anilist_id, title_romaji, title_english, title_native, synonyms, 
                                            cover_url, banner_url, synopsis, genres, format, status)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RELEASING')
@@ -604,17 +635,26 @@ async def sync_anilist_schedule():
                             synonyms = excluded.synonyms,
                             cover_url = CASE WHEN anime.cover_url IS NULL OR anime.cover_url = '' THEN excluded.cover_url ELSE anime.cover_url END,
                             status = 'RELEASING'
-                    """, [anilist_id, romaji, english, native, synonyms, cover_url, banner_url, synopsis, genres, format_type])
+                    """, [anilist_id, romaji, english, native, synonyms, cover_url, banner_url, synopsis, genres, format_type]))
 
-                    # 2. Get local anime_id
-                    rows = await execute_sql("SELECT id FROM anime WHERE anilist_id = ?", [anilist_id])
-                    if rows:
-                        aid = rows[0]["id"]
-                        await execute_sql("""
-                            INSERT INTO episodes (anime_id, episode_number, status, aired_at)
-                            VALUES (?, ?, 'pending', ?)
-                            ON CONFLICT(anime_id, episode_number) DO NOTHING
-                        """, [aid, ep_num, airing_ts])
+                # Execute all anime upserts in one batch
+                await execute_sql_batch(batch_stmts)
+
+                # Now batch episode inserts (need anime IDs first)
+                ep_batch = []
+                for item in schedules:
+                    m = item["media"]
+                    anilist_id = m["id"]
+                    ep_num = item["episode"]
+                    airing_ts = item["airingAt"]
+                    ep_batch.append(("""
+                        INSERT INTO episodes (anime_id, episode_number, status, aired_at)
+                        VALUES ((SELECT id FROM anime WHERE anilist_id = ?), ?, 'pending', ?)
+                        ON CONFLICT(anime_id, episode_number) DO NOTHING
+                    """, [anilist_id, ep_num, airing_ts]))
+
+                await execute_sql_batch(ep_batch)
+                log_message(f"AniList page {page}: synced {len(schedules)} entries.")
 
                 has_next = data.get("pageInfo", {}).get("hasNextPage", False)
                 page += 1
@@ -626,20 +666,28 @@ async def sync_anilist_schedule():
 # ─── Main Episode Resolution Loop ─────────────────────────────
 async def resolve_pending_episodes():
     log_message("Resolving pending episodes...")
+    # Only get the LOWEST pending episode per anime (no point searching Ep 337 if Ep 1-336 aren't done)
+    # Also only consider episodes aired in the last 14 days to avoid searching for ancient backlog
+    cutoff_ts = int(time.time()) - (14 * 24 * 60 * 60)
     pending_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.status, e.aired_at, e.last_checked,
                a.title_romaji, a.title_english, a.synonyms, a.format
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'pending'
+          AND e.aired_at >= ?
+          AND e.episode_number = (
+              SELECT MIN(e2.episode_number) FROM episodes e2
+              WHERE e2.anime_id = e.anime_id AND e2.status = 'pending' AND e2.aired_at >= ?
+          )
         ORDER BY e.aired_at DESC, e.last_checked ASC
-    """)
+    """, [cutoff_ts, cutoff_ts])
 
     if not pending_eps:
         log_message("No pending episodes found.")
         return
 
-    log_message(f"Found {len(pending_eps)} pending episodes.")
+    log_message(f"Found {len(pending_eps)} anime with pending episodes (lowest ep per anime).")
     downloads_count = 0
 
     for ep in pending_eps:
@@ -788,7 +836,7 @@ async def check_audio_upgrades():
 
 # ─── Main Entry Point ──────────────────────────────────────────
 async def main():
-    log_message("=== Starting Anime Sync Job on GitHub Actions ===")
+    log_message("=== Starting Data Sync Pipeline ===")
     t0 = time.time()
     await sync_anilist_schedule()
     await resolve_pending_episodes()
