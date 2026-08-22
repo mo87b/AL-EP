@@ -82,7 +82,7 @@ async def execute_sql(sql: str, args: list = None) -> list:
     async with httpx.AsyncClient(timeout=25.0) as client:
         r = await client.post(f"{TURSO_URL}/v2/pipeline", headers=headers, json=body)
         if r.status_code != 200:
-            log_message(f"Turso SQL error ({r.status_code}): {r.text}")
+            log_message(f"DB error ({r.status_code})")
             return []
         res = r.json()
         exec_result = res["results"][0]["response"]["result"]
@@ -103,7 +103,7 @@ async def execute_sql_batch(statements: list) -> list:
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.post(f"{TURSO_URL}/v2/pipeline", headers=headers, json={"requests": requests})
         if r.status_code != 200:
-            log_message(f"Turso batch SQL error ({r.status_code}): {r.text}")
+            log_message(f"DB batch error ({r.status_code})")
             return []
         res = r.json()
         results = []
@@ -513,7 +513,7 @@ def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
         "--allow-overwrite=true",
     ]
 
-    log_message(f"Starting aria2c download: {torrent_title}")
+    log_message(f"Starting download...")
     proc = subprocess.run(cmd, timeout=TORRENT_DOWNLOAD_TIMEOUT, capture_output=True, text=True)
     if proc.returncode != 0:
         shutil.rmtree(download_dir, ignore_errors=True)
@@ -540,7 +540,7 @@ def upload_pixeldrain(file_path: str, filename: str) -> dict:
     headers = {}
     auth = ("", PIXELDRAIN_API_KEY) if PIXELDRAIN_API_KEY else None
 
-    log_message(f"Uploading {filename} to Pixeldrain...")
+    log_message(f"Uploading {filename}...")
     with open(file_path, "rb") as f:
         with httpx.Client(timeout=300.0) as client:
             r = client.put(url, content=f.read(), auth=auth, headers=headers)
@@ -588,7 +588,7 @@ query ($page: Int, $airingAt_greater: Int, $airingAt_lesser: Int) {
 """
 
 async def sync_anilist_schedule():
-    log_message("Syncing schedule from AniList...")
+    log_message("Syncing schedule...")
     now = int(time.time())
     twelve_days_ago = now - (12 * 24 * 60 * 60)
     page = 1
@@ -654,13 +654,13 @@ async def sync_anilist_schedule():
                     """, [anilist_id, ep_num, airing_ts]))
 
                 await execute_sql_batch(ep_batch)
-                log_message(f"AniList page {page}: synced {len(schedules)} entries.")
+                log_message(f"Page {page}: synced {len(schedules)} entries.")
 
                 has_next = data.get("pageInfo", {}).get("hasNextPage", False)
                 page += 1
                 await asyncio.sleep(1.5)
         except Exception as e:
-            log_message(f"AniList sync error on page {page}: {e}")
+            log_message(f"Schedule sync error on page {page}: {e}")
             break
 
 # ─── Main Episode Resolution Loop ─────────────────────────────
@@ -744,7 +744,7 @@ async def resolve_pending_episodes():
         audio_score = get_audio_score(torrent_title)
         is_multi_audio = 1 if audio_score >= 1 else 0
 
-        log_message(f"Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio Score: {audio_score})")
+        log_message(f"Selected: {romaji} Ep {ep_num} (Seeders: {winner['seeders']}, Audio: {audio_score})")
 
         try:
             dl_dir, v_path, v_name, v_size = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
@@ -773,7 +773,7 @@ async def resolve_pending_episodes():
                 WHERE id = ?
             """, [pd_url, pd_id, pd_url, pd_id, size_mb, winner["magnet"], is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
 
-            log_message(f"Successfully uploaded & saved {romaji} Ep {ep_num} -> {pd_url}")
+            log_message(f"Successfully processed {romaji} Ep {ep_num}")
             downloads_count += 1
 
         except Exception as ex:
@@ -782,7 +782,7 @@ async def resolve_pending_episodes():
 
 # ─── Audio Upgrade Monitor ─────────────────────────────────────
 async def check_audio_upgrades():
-    log_message("Checking recently uploaded episodes for Audio Upgrades (Multi-Audio)...")
+    log_message("Checking for quality upgrades...")
     recent_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.audio_score, e.uploaded_at,
                a.title_romaji, a.title_english, a.synonyms, a.format
@@ -829,7 +829,7 @@ async def check_audio_upgrades():
                         WHERE id = ?
                     """, [pd_url, pd_id, pd_url, pd_id, size_mb, target["magnet"], new_score, ep["ep_id"]])
 
-                    log_message(f"Successfully upgraded {romaji} Ep {ep_num} to Multi-Audio -> {pd_url}")
+                    log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
                     break
                 except Exception as up_ex:
                     log_message(f"Failed to apply audio upgrade for {romaji}: {up_ex}")
