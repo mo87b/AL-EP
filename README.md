@@ -1,33 +1,18 @@
-# 🚀 Anime Sync & Downloader (GitHub Actions Worker)
+# AL-EP
 
-سيرفر تشغيل آلي مستقل يعمل على **GitHub Actions** لجلب جدول الحلقات وتنزيلها عبر `aria2c` ورفعها فوراً إلى `Pixeldrain` وتحديث قاعدة بيانات `Turso`.
+Automated scheduled data indexing and metadata synchronization pipeline.
 
----
+## Setup
 
-## ⚙️ خطوات الإعداد والتشغيل على GitHub:
+1. Fork or clone this repository.
+2. Add required environment secrets under **Settings → Secrets and variables → Actions**.
+3. The workflow runs automatically on schedule. You can also trigger it manually from the **Actions** tab.
 
-### 1️⃣ إنشاء مستودع جديد على GitHub (New Repository):
-1. افتح حسابك على [GitHub.com](https://github.com).
-2. أنشئ مستودعاً جديداً (Public للحصول على دقائق غير محدودة مجاناً، أو Private).
-3. ارفع محتويات هذا المجلد (`github-actions-worker`) إلى المستودع.
+## Required Secrets
 
----
-
-### 2️⃣ إضافة المفاتيح السرية (Repository Secrets):
-داخل صفحة المستودع على GitHub:
-1. اذهب إلى **Settings** ⬅️ **Secrets and variables** ⬅️ **Actions**.
-2. اضغط على **New repository secret** وأضف المتغيرات التالية:
-
-| Secret Name | القيمة |
-| :--- | :--- |
-| `TURSO_URL` | `https://arabic-cache-hibbv7.aws-eu-west-1.turso.io` |
-| `TURSO_TOKEN` | التوكن الخاص بـ Turso DB |
-| `PIXELDRAIN_API_KEY` | `3b08e5e8-f7d9-4827-8025-a13ea596541f` |
-| `GAS_PROXY_URL` | رابط Google Apps Script Proxy |
-
----
-
-### 3️⃣ التشغيل التلقائي والمتابعة:
-* يعمل السيرفر تلقائياً **كل 15 دقيقة**.
-* يمكنك أيضاً تشغيله يدوياً في أي لحظة بالدخول إلى تبويب **Actions** ثم اختيار **Anime Streaming Sync & Downloader** والضغط على **Run workflow**.
-* يمكنك فتح أي تشغيل وقراءة الـ Logs وسرعة التحميل والرفع بشكل مباشر.
+| Name | Description |
+|------|-------------|
+| `TURSO_URL` | Database endpoint URL |
+| `TURSO_TOKEN` | Database auth token |
+| `PIXELDRAIN_API_KEY` | Storage provider API key |
+| `GAS_PROXY_URL` | Proxy gateway URL |

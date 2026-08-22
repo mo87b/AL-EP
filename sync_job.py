@@ -13,10 +13,10 @@ import xml.etree.ElementTree as ET
 import httpx
 
 # ─── Environment Configuration ──────────────────────────────────
-TURSO_URL = os.environ.get("TURSO_URL", "https://arabic-cache-hibbv7.aws-eu-west-1.turso.io")
-TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3Nzk1ODI0MjYsImlkIjoiMDE5ZTMxMDUtYTUwMS03NGMzLWJlYWQtZGYwYWQxMTEyNTQ5IiwicmlkIjoiZjM4OTcyZDUtZGFlNC00Y2NlLTkyMzYtYTZmMGUyMGQyNjdiIn0.Fb9-eDibxOS6u23gQa5glQsar0rpy98_KE2nR4Hpcupd0y4mG4l0b-37IHOobo38TXHlz9lIuL2opvPhVW5dAg")
-PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "3b08e5e8-f7d9-4827-8025-a13ea596541f")
-GAS_PROXY_URL = os.environ.get("GAS_PROXY_URL", "https://script.google.com/macros/s/AKfycbwXOJlBLvZ8sTQwDKNnWlGY3qjYKYVQX3aDkM5wINA316ksCOOfIp-jHxUSWoObhjAeqg/exec")
+TURSO_URL = os.environ.get("TURSO_URL", "")
+TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
+PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")
+GAS_PROXY_URL = os.environ.get("GAS_PROXY_URL", "")
 
 MAX_DOWNLOADS_PER_RUN = 5
 TORRENT_DOWNLOAD_TIMEOUT = 300  # 5 minutes per download
