@@ -607,6 +607,7 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                             results.append({
                                 "title": t,
                                 "magnet": torrent_source,
+                                "torrent_id": torrent_id,
                                 "seeders": seeders
                             })
                     if results:
@@ -617,26 +618,34 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
     return []
 
 # ─── aria2c Downloader & Pixeldrain Uploader ──────────────────
+def is_valid_torrent_data(data: bytes) -> bool:
+    """Verifies that bytes represent a valid bencoded torrent file (starts with 'd' and is not HTML)."""
+    if not data or len(data) < 50:
+        return False
+    data_start = data[:100].lower()
+    if data_start.startswith(b"<!doctype") or b"<html" in data_start or b"<head" in data_start:
+        return False
+    return data.startswith(b"d") and (b"announce" in data or b"info" in data)
+
 def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
     download_dir = tempfile.mkdtemp(prefix="anime_")
     torrent_file_path = os.path.join(download_dir, "download.torrent")
+    torrent_input = None
     
     if magnet_url.startswith("http"):
         # 1. Try direct issuance mirror download first
-        downloaded = False
         try:
-            with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
                 r = client.get(magnet_url)
-                if r.status_code == 200:
+                if r.status_code == 200 and is_valid_torrent_data(r.content):
                     with open(torrent_file_path, "wb") as f:
                         f.write(r.content)
                     torrent_input = torrent_file_path
-                    downloaded = True
         except Exception:
             pass
 
         # 2. Fallback to GAS proxy base64 download
-        if not downloaded:
+        if not torrent_input:
             gas_target_url = magnet_url.replace("nyaa.iss.one", "nyaa.si").replace("nyaa.site", "nyaa.si")
             gas_url = f"{GAS_PROXY_URL}?mode=torrent&url={urllib.parse.quote(gas_target_url)}"
             try:
@@ -645,12 +654,20 @@ def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
                     if r.status_code == 200 and r.json().get("status") == 200:
                         import base64
                         raw_bytes = base64.b64decode(r.json()["data"])
-                        with open(torrent_file_path, "wb") as f:
-                            f.write(raw_bytes)
-                        torrent_input = torrent_file_path
-                    else:
-                        torrent_input = magnet_url
+                        if is_valid_torrent_data(raw_bytes):
+                            with open(torrent_file_path, "wb") as f:
+                                f.write(raw_bytes)
+                            torrent_input = torrent_file_path
             except Exception:
+                pass
+
+        # 3. If .torrent files failed, extract ID and build standard magnet link
+        if not torrent_input:
+            id_m = re.search(r'/download/(\d+)', magnet_url)
+            if id_m:
+                # If we only have URL, pass original URL as magnet fallback
+                torrent_input = magnet_url
+            else:
                 torrent_input = magnet_url
     else:
         torrent_input = magnet_url
@@ -662,6 +679,10 @@ def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
         "--seed-time=0",
         "--bt-stop-timeout=120",
         "--file-allocation=none",
+        "--enable-dht=true",
+        "--enable-peer-exchange=true",
+        "--bt-enable-lpd=true",
+        "--bt-max-peers=100",
         f"--bt-tracker={trackers_arg}",
         "--max-connection-per-server=16",
         "--summary-interval=10",
