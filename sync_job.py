@@ -118,16 +118,20 @@ async def execute_sql_batch(statements: list) -> list:
 def clean_title(title: str) -> str:
     if not title or not isinstance(title, str):
         return ""
-    t = re.sub(r'\[.*?\]|\(.*?\)', '', title)
-    t = re.sub(r'[._\+]+', ' ', t)
-    t = re.sub(r'[^\w\s-]', '', t)
-    return re.sub(r'\s+', ' ', t).strip()
+    title = re.sub(r'\(.*?\)', '', title)
+    title = re.sub(r'\[.*?\]', '', title)
+    title = re.sub(r'[:\\/*?"<>|]', ' ', title)
+    title = re.sub(r'[^a-zA-Z0-9\s\-\'\.]', '', title)
+    title = re.sub(r'\s+', ' ', title).strip()
+    return title
 
 def clean_and_strip(title: str) -> str:
-    if not title or not isinstance(title, str):
-        return ""
-    t = re.sub(r'[\(\[\{].*?[\)\]\}]', '', title)
-    t = re.sub(r'[^a-zA-Z0-9\s]', ' ', t)
+    t = clean_title(title)
+    t = re.sub(r'\b\d{4}\b', ' ', t)
+    t = re.sub(r'\b\d+(st|nd|rd|th)\s+season\b', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bseason\s+\d+\b', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bcour\s+\d+\b', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\bs\d+\b', '', t, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', t).strip()
 
 def get_part_number(title: str) -> int:
@@ -196,19 +200,7 @@ def get_season_number(title: str) -> int:
 def is_blacklisted_platform(title: str) -> bool:
     if not title or not isinstance(title, str):
         return False
-    t_lower = title.lower()
-    blacklisted = [
-        'adn', 'animation digital network', 'vostfr', 'subfrench',
-        'french', 'ita', 'italian', 'ger', 'german', 'es-la', 'latino',
-        'castellano', 'rus', 'russian', 'raw'
-    ]
-    for b in blacklisted:
-        if re.search(rf'\b{b}\b', t_lower):
-            # Exception if multi-sub is explicitly present
-            if 'multisub' in t_lower or 'multi-sub' in t_lower or 'multi-subs' in t_lower or 'multi subs' in t_lower:
-                return False
-            return True
-    return False
+    return bool(re.search(r'\b(nf|netflix|iq|iqiyi)\b', title.lower()))
 
 def get_audio_score(title: str) -> int:
     if not title or not isinstance(title, str):
@@ -221,112 +213,164 @@ def get_audio_score(title: str) -> int:
     return 0
 
 def get_platform_score(title: str) -> int:
+    if not title or not isinstance(title, str):
+        return 0
     t_lower = title.lower()
-    if 'cr' in t_lower or 'crunchyroll' in t_lower:
-        return 4
-    if 'amzn' in t_lower or 'amazon' in t_lower or 'prime' in t_lower:
+    if re.search(r'\b(cr|crunchyroll|amzn|amazon|shahid|starzplay|starz|adn)\b', t_lower):
         return 3
-    if 'bili' in t_lower or 'bilibili' in t_lower:
+    elif re.search(r'\b(nf|netflix)\b', t_lower):
         return 2
-    if 'nf' in t_lower or 'netflix' in t_lower:
+    elif re.search(r'\b(bili|bilibili|iq|iqiyi|disney|hulu|abema|baha|bahamut|ani-one|anione|muse|yt|youtube|wetv)\b', t_lower):
         return 1
     return 0
 
 def get_quality_weight(title: str) -> int:
+    if not title or not isinstance(title, str):
+        return 0
     t_lower = title.lower()
-    if '1080p' in t_lower:
+    if "1080" in t_lower:
         return 3
-    if '720p' in t_lower:
+    elif "720" in t_lower:
         return 2
-    if '480p' in t_lower:
+    elif "480" in t_lower:
         return 1
     return 0
 
 def get_source_weight(title: str) -> int:
+    if not title or not isinstance(title, str):
+        return 0
     t_lower = title.lower()
-    if 'web-dl' in t_lower:
-        return 3
-    if 'webrip' in t_lower or 'web' in t_lower:
+    if "web-dl" in t_lower or "webdl" in t_lower:
         return 2
-    if 'hdtv' in t_lower or 'tv' in t_lower:
+    elif "webrip" in t_lower:
         return 1
     return 0
+
+# Comprehensive words to ignore during title match to avoid failing on season tokens or release formats
+SEASON_STOPWORDS = {
+    "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th",
+    "season", "cour", "part", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9",
+    "tv", "bd", "bluray", "blu-ray", "dvd", "web", "web-dl", "webrip", "hdtv", 
+    "uncensored", "uncut", "censored", "dual", "multi", "audio", "sub", "subs", 
+    "subtitle", "subtitles", "dub", "dubs", "dubbed", "v0", "v1", "v2", "v3", 
+    "batch", "reupload", "re-upload", "remux", "hevc", "x264", "x265", "h264", "h265", 
+    "10bit", "10bits", "8bit", "8bits", "version", "edit", "specials", "special", "mkv", "mp4", "avi", "webm",
+    "1080p", "720p", "480p", "1080", "720", "480", "2160p", "2160", "4k", "5k", "8k",
+    "aac2", "aac", "aac5", "ddp2", "ddp5", "ddp", "dts", "ac3", "flac", "avc", "av1", "av01",
+    "hdr", "hdr10", "hdr10plus", "sdr", "atmos", "hi10p", "hi10",
+    "amzn", "cr", "cru", "nf", "nflx", "netflix", "hulu", "dnp", "disney", "bilibili", "bili", "bsite", "yt", "youtube", "adn", "wetv", "iq", "iqiyi", "mgtv", "youku", "abema", "baha", "bahamut",
+    "varyg", "subsplease", "erai-raws", "erai", "judas", "ember", "asw", "kaede", "horriblesubs", "horrible", "sirius", "pas", "commie",
+    "tsundere", "raws", "rapta", "repack", "vostfr", "dl", "ona", "ova", "movie", "weekly",
+    "eng", "english", "jap", "japanese", "ara", "arabic", "multi-subs", "multisubs", "multisub", "multi-sub",
+    "gradation"
+}
+
+def get_clean_words(title: str) -> list:
+    title_lower = title.lower()
+    title_no_se = re.sub(r'\b(s\d+e\d+|s\d+|e\d+)\b', ' ', title_lower)
+    title_no_num = re.sub(r'\b\d+\b', ' ', title_no_se)
+    clean_t = title_no_num.replace('.', ' ').replace('-', ' ')
+    clean_t = clean_t.replace("'", "")
+    clean_t = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_t)
+    words = clean_t.split()
+    
+    particles = {
+        "no", "to", "in", "of", "a", "an", "the", "is", "at", "by", "on", 
+        "and", "or", "for", "with", "wa", "ga", "wo", "ni", "de", "ka", "mo"
+    }
+    
+    filtered = []
+    for w in words:
+        w_stripped = w.strip("-'")
+        if not w_stripped:
+            continue
+        if w_stripped in SEASON_STOPWORDS or w_stripped in particles:
+            continue
+        if len(w_stripped) >= 2:
+            filtered.append(w_stripped)
+        elif len(words) == 1:
+            filtered.append(w_stripped)
+    return filtered
 
 def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> bool:
     if not torrent_title or not romaji:
         return False
-
     t_lower = torrent_title.lower()
-    if is_blacklisted_platform(t_lower):
-        return False
+    synonyms = synonyms or []
 
-    # Extract episode number
-    ep_num = None
-    m = re.search(r'\bs\d+e(\d+)\b', t_lower)
-    if m:
-        ep_num = int(m.group(1))
+    # 1. Episode matching check
+    m_ep = re.search(r'\b(?:s\d+)?e(\d+)\b', t_lower)
+    if m_ep:
+        if int(m_ep.group(1)) != ep:
+            return False
     else:
-        m = re.search(r'\s+-\s+(\d+)\b', t_lower)
-        if m:
-            ep_num = int(m.group(1))
-        else:
-            m = re.search(r'\b(?:e|ep|episode)\s*0*(\d+)\b', t_lower)
-            if m:
-                ep_num = int(m.group(1))
-            else:
-                m = re.search(r'\b0*(\d+)\s*(?:\[|\()', t_lower)
-                if m:
-                    ep_num = int(m.group(1))
+        bypass_ep_check = False
+        if is_special and ep == 1:
+            clean_title_for_ep = re.sub(r'\b(1080p|720p|480p|2160p|1080|720|480|2160|3d|4k|5k|8k|x264|x265|h264|h265|10bit|8bit|v\d+)\b', '', t_lower)
+            other_ep_match = re.search(r'\b(?:ep|episode|ep\.|sp|special)?\s*0*([2-9]|\d{2,})\b', clean_title_for_ep)
+            if not other_ep_match:
+                bypass_ep_check = True
+                
+        if not bypass_ep_check:
+            ep_pattern = re.compile(rf'\b0*{ep}\b')
+            if not ep_pattern.search(t_lower):
+                return False
 
-    if not is_special and ep_num != ep:
-        return False
-
+    # 2. Canonical Season & Part Enforcement
+    torrent_season = get_season_number(torrent_title)
     clean_romaji = clean_title(romaji)
     clean_english = clean_title(english) if english else ""
 
-    # Canonical Season Enforcement
     target_season = get_season_number(clean_romaji)
     if target_season == 1 and clean_english:
         eng_s = get_season_number(clean_english)
         if eng_s > 1:
             target_season = eng_s
 
-    target_part = get_part_number(clean_romaji) or (get_part_number(clean_english) if english else 0)
-
-    torrent_season = get_season_number(torrent_title)
     if torrent_season != target_season:
         return False
 
+    target_part = get_part_number(clean_romaji) or (get_part_number(clean_english) if english else 0)
     torrent_part = get_part_number(torrent_title)
     if torrent_part != target_part:
         return False
 
-    def get_clean_words(raw_str: str) -> list:
-        s = clean_title(raw_str).lower()
-        s = re.sub(r'\b\d+(st|nd|rd|th)\s+season\b', ' ', s)
-        s = re.sub(r'\bseason\s+\d+\b', ' ', s)
-        s = re.sub(r'\bpart\s+\d+\b', ' ', s)
-        s = re.sub(r'\bcour\s+\d+\b', ' ', s)
-        s = re.sub(r'\bs\d+\b', ' ', s)
-        s = re.sub(r'\b\d+\b', ' ', s)
-        stopwords = {'the', 'a', 'an', 'no', 'ni', 'to', 'wa', 'ga', 'de', 'o', 'wo', 'mo', 'na', 'season', 'part', 'cour'}
-        return [w for w in s.split() if w not in stopwords and len(w) >= 2]
-
-    def is_title_match(anime_title_str: str, torrent_str: str) -> bool:
-        words = get_clean_words(anime_title_str)
-        if not words:
+    # 3. Title Matching with ratio & delimiter support
+    def is_title_match(anime_title: str, torrent_title_lower: str) -> bool:
+        if not anime_title:
             return False
-        matching = [w for w in words if w in torrent_str]
-        if len(words) <= 2:
-            return len(matching) == len(words)
-        if len(words) == 3:
-            return len(matching) >= 2
-        return len(matching) / len(words) >= 0.75
+            
+        def check_match(raw_title_str: str) -> bool:
+            clean_t = clean_title(raw_title_str)
+            words = get_clean_words(clean_t)
+            if not words:
+                return False
+            matching_words = [w for w in words if w in torrent_title_lower]
+            ratio = len(matching_words) / len(words)
+            
+            if len(words) <= 2:
+                return len(matching_words) == len(words)
+            if len(words) == 3:
+                return len(matching_words) >= 2
+            return ratio >= 0.75
+
+        if check_match(anime_title):
+            return True
+
+        delimiters = [':', '-']
+        for delim in delimiters:
+            if delim in anime_title:
+                parts = anime_title.split(delim)
+                for part in parts:
+                    part_stripped = part.strip()
+                    if len(get_clean_words(clean_title(part_stripped))) >= 2:
+                        if check_match(part_stripped):
+                            return True
+        return False
 
     romaji_match = is_title_match(romaji, t_lower)
     eng_match = is_title_match(english, t_lower) if english else False
     syn_match = False
-    synonyms = synonyms or []
     for syn in synonyms:
         if syn and is_title_match(syn, t_lower):
             syn_match = True
@@ -335,23 +379,56 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
     if not romaji_match and not eng_match and not syn_match:
         return False
 
-    # Extra words check: verify torrent doesn't contain a different cour/season subtitle
+    # 4. Extra words check (with Japanese concatenation check)
     is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_lower))
     if not is_trusted_group:
-        all_anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
+        torrent_clean = clean_title(torrent_title)
+        torrent_words = get_clean_words(torrent_clean)
+        
+        anime_words = set()
+        anime_words.update(get_clean_words(romaji))
+        if english:
+            anime_words.update(get_clean_words(english))
         for syn in synonyms:
             if syn:
-                all_anime_words.update(get_clean_words(syn))
+                anime_words.update(get_clean_words(syn))
+                
+        extra_words = []
+        concat_parts = set()
+        for i in range(len(torrent_words) - 1):
+            pair_word = torrent_words[i] + torrent_words[i+1]
+            if pair_word in anime_words:
+                concat_parts.add(torrent_words[i])
+                concat_parts.add(torrent_words[i+1])
 
-        t_clean = re.sub(r'\[.*?\]|\(.*?\)', ' ', t_lower)
-        t_clean = re.split(r'\s+-\s+\d+', t_clean)[0]
-        t_clean = re.split(r'\bs\d+e\d+\b', t_clean)[0]
-        t_words = get_clean_words(t_clean)
-        
-        ignored_meta = {'1080p', '720p', '480p', 'hevc', 'x264', 'x265', 'avc', 'aac', 'web-dl', 'webrip', 'cr', 'amzn', 'bili', 'nf'}
-        t_extra_words = [w for w in t_words if w not in all_anime_words and w not in ignored_meta]
-        if len(t_extra_words) >= 2:
+        for w in torrent_words:
+            if w in anime_words or w in concat_parts:
+                continue
+            is_concat = False
+            for w1 in anime_words:
+                if len(w1) >= 3 and w.startswith(w1):
+                    remainder = w[len(w1):]
+                    if remainder in anime_words:
+                        is_concat = True
+                        break
+            if not is_concat:
+                extra_words.append(w)
+                
+        if extra_words:
             return False
+
+    # 5. Source check: MUST be Multi-Sub release
+    is_multi_sub = bool(re.search(
+        r'\b(multi|m)\s*[-_:]?\s*subs?\b|'
+        r'multisubs?|'
+        r'multiple\s+subtitles?|'
+        r'multiple\s+subs?\b|'
+        r'\[multi[-_ ]?subs?\]|'
+        r'\[multiple[-_ ]?subtitles?\]',
+        t_lower
+    ))
+    if not is_multi_sub:
+        return False
 
     return True
 
