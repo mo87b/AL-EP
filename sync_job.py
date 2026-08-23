@@ -138,6 +138,32 @@ async def ensure_database_schema():
     except Exception:
         pass
 
+    # Auto-purge Ecchi / Hentai into blacklist and remove from database
+    try:
+        now_ts = int(time.time())
+        await execute_sql("""
+            INSERT INTO anime_blacklist (anilist_id, title_romaji, reason, blacklisted_at)
+            SELECT anilist_id, title_romaji, 'ecchi_hentai_genre', ?
+            FROM anime
+            WHERE lower(genres) LIKE '%ecchi%' OR lower(genres) LIKE '%hentai%'
+            ON CONFLICT(anilist_id) DO UPDATE SET reason = 'ecchi_hentai_genre'
+        """, [now_ts])
+
+        await execute_sql("""
+            DELETE FROM episodes
+            WHERE anime_id IN (
+                SELECT id FROM anime
+                WHERE lower(genres) LIKE '%ecchi%' OR lower(genres) LIKE '%hentai%'
+            )
+        """)
+
+        await execute_sql("""
+            DELETE FROM anime
+            WHERE lower(genres) LIKE '%ecchi%' OR lower(genres) LIKE '%hentai%'
+        """)
+    except Exception:
+        pass
+
 async def get_blacklisted_ids() -> set:
     rows = await execute_sql("SELECT anilist_id FROM anime_blacklist")
     return {r["anilist_id"] for r in rows} if rows else set()
