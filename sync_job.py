@@ -689,7 +689,7 @@ def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
         "--allow-overwrite=true",
     ]
 
-    log_message(f"Starting download...")
+    log_message(f"Starting download: {torrent_title}")
     proc = subprocess.run(cmd, timeout=TORRENT_DOWNLOAD_TIMEOUT, capture_output=True, text=True)
     if proc.returncode != 0:
         shutil.rmtree(download_dir, ignore_errors=True)
@@ -1043,7 +1043,7 @@ async def resolve_pending_episodes():
         audio_score = get_audio_score(torrent_title)
         is_multi_audio = 1 if audio_score >= 1 else 0
 
-        log_message(f"Selected: {romaji} Ep {ep_num} (Seeders: {winner['seeders']}, Audio: {audio_score})")
+        log_message(f"Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio Score: {audio_score})")
 
         try:
             dl_dir, v_path, v_name, v_size = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
@@ -1116,7 +1116,7 @@ async def check_audio_upgrades():
                 better.sort(key=lambda x: (get_audio_score(x["title"]), x["seeders"]), reverse=True)
                 target = better[0]
                 new_score = get_audio_score(target["title"])
-                log_message(f"Audio upgrade found for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score}")
+                log_message(f"Audio upgrade found for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score} using: {target['title']}")
                 
                 try:
                     dl_dir, v_path, v_name, v_size = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
