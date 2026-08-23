@@ -610,17 +610,9 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                             continue
 
                         if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
-                            id_match = re.search(r'/(?:download|view)/(\d+)', torrent_url)
-                            if id_match:
-                                torrent_id = id_match.group(1)
-                            else:
-                                torrent_id = torrent_url.split('/')[-1].split('.')[0]
-
-                            torrent_source = f"https://nyaa.iss.one/download/{torrent_id}.torrent"
                             results.append({
                                 "title": t,
-                                "magnet": torrent_source,
-                                "torrent_id": torrent_id,
+                                "magnet": torrent_url,
                                 "seeders": seeders
                             })
                     if results:
@@ -640,50 +632,35 @@ def is_valid_torrent_data(data: bytes) -> bool:
         return False
     return data.startswith(b"d") and (b"announce" in data or b"info" in data)
 
-def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
+def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     download_dir = tempfile.mkdtemp(prefix="anime_")
     torrent_file_path = os.path.join(download_dir, "download.torrent")
-    torrent_input = None
     
-    if magnet_url.startswith("http"):
-        # 1. Try direct issuance mirror download first
+    # 1. Download .torrent file directly through Google Apps Script Proxy
+    if torrent_source.startswith("http"):
+        gas_url = f"{GAS_PROXY_URL}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
         try:
-            with httpx.Client(timeout=15.0, follow_redirects=True) as client:
-                r = client.get(magnet_url)
-                if r.status_code == 200 and is_valid_torrent_data(r.content):
-                    with open(torrent_file_path, "wb") as f:
-                        f.write(r.content)
-                    torrent_input = torrent_file_path
-        except Exception:
-            pass
-
-        # 2. Fallback to GAS proxy base64 download
-        if not torrent_input:
-            gas_target_url = magnet_url.replace("nyaa.iss.one", "nyaa.si").replace("nyaa.site", "nyaa.si")
-            gas_url = f"{GAS_PROXY_URL}?mode=torrent&url={urllib.parse.quote(gas_target_url)}"
-            try:
-                with httpx.Client(timeout=30.0) as client:
-                    r = client.get(gas_url)
-                    if r.status_code == 200 and r.json().get("status") == 200:
+            with httpx.Client(timeout=30.0) as client:
+                r = client.get(gas_url)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get("status") == 200 and data.get("data"):
                         import base64
-                        raw_bytes = base64.b64decode(r.json()["data"])
+                        raw_bytes = base64.b64decode(data["data"])
                         if is_valid_torrent_data(raw_bytes):
                             with open(torrent_file_path, "wb") as f:
                                 f.write(raw_bytes)
                             torrent_input = torrent_file_path
-            except Exception:
-                pass
-
-        # 3. If .torrent files failed, extract ID and build standard magnet link
-        if not torrent_input:
-            id_m = re.search(r'/download/(\d+)', magnet_url)
-            if id_m:
-                # If we only have URL, pass original URL as magnet fallback
-                torrent_input = magnet_url
-            else:
-                torrent_input = magnet_url
+                        else:
+                            torrent_input = torrent_source
+                    else:
+                        torrent_input = torrent_source
+                else:
+                    torrent_input = torrent_source
+        except Exception:
+            torrent_input = torrent_source
     else:
-        torrent_input = magnet_url
+        torrent_input = torrent_source
 
     trackers_arg = ",".join(NYAA_TRACKERS)
     cmd = [
