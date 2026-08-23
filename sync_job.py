@@ -376,7 +376,18 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
     if torrent_part != target_part:
         return False
 
-    # 3. Title Matching with ratio & delimiter support
+    # 3. Filter synonyms: remove invalid non-latin remnants that produce 1-letter false positives (like 'X')
+    valid_synonyms = []
+    for s in synonyms:
+        if not s or not isinstance(s, str):
+            continue
+        if re.search(r'[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff]', s):
+            c_words = get_clean_words(clean_title(s))
+            if len(c_words) < 2 or all(len(w) < 3 for w in c_words):
+                continue
+        valid_synonyms.append(s)
+
+    # Title Matching with ratio, word-boundary, and delimiter support
     def is_title_match(anime_title: str, torrent_title_lower: str) -> bool:
         if not anime_title:
             return False
@@ -386,7 +397,8 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
             words = get_clean_words(clean_t)
             if not words:
                 return False
-            matching_words = [w for w in words if w in torrent_title_lower]
+            # Use exact word boundary matching (\bword\b) to avoid matching single letters inside unrelated words
+            matching_words = [w for w in words if re.search(rf'\b{re.escape(w)}\b', torrent_title_lower)]
             ratio = len(matching_words) / len(words)
             
             if len(words) <= 2:
@@ -411,19 +423,20 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
 
     romaji_match = is_title_match(romaji, t_lower)
     eng_match = is_title_match(english, t_lower) if english else False
-    syn_match = any(is_title_match(syn, t_lower) for syn in synonyms if syn)
+    syn_match = any(is_title_match(syn, t_lower) for syn in valid_synonyms)
 
     if not romaji_match and not eng_match and not syn_match:
         return False
 
     # 4. Extra words check (with Japanese concatenation check)
-    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_lower))
+    clean_matched_words = get_clean_words(romaji)
+    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_lower)) and len(clean_matched_words) >= 2
     if not is_trusted_group:
         torrent_clean = clean_title(torrent_title)
         torrent_words = get_clean_words(torrent_clean)
         
         anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
-        for syn in synonyms:
+        for syn in valid_synonyms:
             if syn:
                 anime_words.update(get_clean_words(syn))
                 
