@@ -558,67 +558,59 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
 # ─── Nyaa Search & Proxy Integration ──────────────────────────
 async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> list:
     encoded_query = urllib.parse.quote(query)
-    sources = [
-        {"type": "rss", "url": f"{GAS_PROXY_URL}?q={encoded_query}"},
-        {"type": "rss", "url": f"https://nyaa.si/?page=rss&q={encoded_query}"},
-        {"type": "rss", "url": f"https://nyaa.site/?page=rss&q={encoded_query}"}
-    ]
-
+    url = f"{GAS_PROXY_URL}?q={encoded_query}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    for src in sources:
-        try:
-            await asyncio.sleep(0.3)
-            async with httpx.AsyncClient(timeout=25.0, headers=headers, follow_redirects=True) as client:
-                r = await client.get(src["url"])
-                if r.status_code == 200:
-                    raw_items = []
-                    if src.get("type") == "api" or (r.text.startswith("{") and "data" in r.text):
-                        data = r.json()
-                        items = data.get("data", [])
-                        for item in items:
-                            raw_items.append({
-                                "title": item.get("title", ""),
-                                "torrent": item.get("torrent", ""),
-                                "seeders": int(item.get("seeders") or 0)
-                            })
-                    elif "<rss" in r.text or "<item" in r.text:
-                        root = ET.fromstring(r.content)
-                        items = root.findall(".//item")
-                        for item in items:
-                            title_el = item.find("title")
-                            link_el = item.find("link")
-                            title = title_el.text if title_el is not None else ""
-                            torrent_url = link_el.text if link_el is not None else ""
-                            seeders = 0
-                            for child in item:
-                                if child.tag.endswith("seeders"):
-                                    seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
-                                    break
-                            raw_items.append({
-                                "title": title,
-                                "torrent": torrent_url,
-                                "seeders": seeders
-                            })
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
+            r = await client.get(url)
+            if r.status_code == 200:
+                raw_items = []
+                if r.text.startswith("{") and "data" in r.text:
+                    data = r.json()
+                    for item in data.get("data", []):
+                        raw_items.append({
+                            "title": item.get("title", ""),
+                            "torrent": item.get("torrent", ""),
+                            "seeders": int(item.get("seeders") or 0)
+                        })
+                elif "<rss" in r.text or "<item" in r.text:
+                    root = ET.fromstring(r.content)
+                    items = root.findall(".//item")
+                    for item in items:
+                        title_el = item.find("title")
+                        link_el = item.find("link")
+                        title = title_el.text if title_el is not None else ""
+                        torrent_url = link_el.text if link_el is not None else ""
+                        seeders = 0
+                        for child in item:
+                            if child.tag.endswith("seeders"):
+                                seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
+                                break
+                        raw_items.append({
+                            "title": title,
+                            "torrent": torrent_url,
+                            "seeders": seeders
+                        })
 
-                    results = []
-                    for item in raw_items:
-                        t = item["title"]
-                        torrent_url = item["torrent"]
-                        seeders = item["seeders"]
-                        if not t or not torrent_url:
-                            continue
+                results = []
+                for item in raw_items:
+                    t = item["title"]
+                    torrent_url = item["torrent"]
+                    seeders = item["seeders"]
+                    if not t or not torrent_url:
+                        continue
 
-                        if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
-                            results.append({
-                                "title": t,
-                                "magnet": torrent_url,
-                                "seeders": seeders
-                            })
-                    if results:
-                        return results
-        except Exception:
-            pass
+                    if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
+                        results.append({
+                            "title": t,
+                            "magnet": torrent_url,
+                            "seeders": seeders
+                        })
+                if results:
+                    return results
+    except Exception:
+        pass
 
     return []
 
@@ -975,14 +967,20 @@ async def resolve_pending_episodes():
         queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special, erai_title=erai_title)
         
         all_results = []
-        for i, q in enumerate(queries):
-            res_list = await search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special)
-            if res_list:
-                all_results.extend(res_list)
-                if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', r["title"].lower())) for r in res_list):
-                    break
-                if len(all_results) >= 10 or i >= 3:
-                    break
+        for i in range(0, min(len(queries), 6), 2):
+            batch = queries[i:i+2]
+            tasks = [
+                search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special)
+                for q in batch
+            ]
+            batch_res = await asyncio.gather(*tasks, return_exceptions=True)
+            for res_list in batch_res:
+                if isinstance(res_list, list) and res_list:
+                    all_results.extend(res_list)
+            if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', r["title"].lower())) for r in all_results):
+                break
+            if len(all_results) >= 10:
+                break
 
         # Deduplicate
         seen_magnets = set()
@@ -1099,37 +1097,46 @@ async def check_audio_upgrades():
         synonyms = json.loads(ep["synonyms"]) if ep["synonyms"] else []
 
         queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, erai_title=erai_title)
-        for q in queries[:4]:
-            results = await search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms)
-            better = [r for r in results if get_audio_score(r["title"]) > current_audio and r["seeders"] >= 1]
+        better = []
+        for i in range(0, min(len(queries), 4), 2):
+            batch = queries[i:i+2]
+            tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms) for q in batch]
+            batch_res = await asyncio.gather(*tasks, return_exceptions=True)
+            for res_list in batch_res:
+                if isinstance(res_list, list) and res_list:
+                    for r in res_list:
+                        if get_audio_score(r["title"]) > current_audio and r.get("seeders", 0) >= 1:
+                            better.append(r)
             if better:
-                better.sort(key=lambda x: (get_audio_score(x["title"]), x["seeders"]), reverse=True)
-                target = better[0]
-                new_score = get_audio_score(target["title"])
-                log_message(f"Audio upgrade found for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score} using: {target['title']}")
-                
-                try:
-                    dl_dir, v_path, v_name, v_size = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
-                    size_mb = round(v_size / 1048576, 2)
-                    upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
-                    shutil.rmtree(dl_dir, ignore_errors=True)
+                break
 
-                    if ep["pixeldrain_id"]:
-                        delete_from_pixeldrain(ep["pixeldrain_id"])
+        if better:
+            better.sort(key=lambda x: (get_audio_score(x["title"]), x["seeders"]), reverse=True)
+            target = better[0]
+            new_score = get_audio_score(target["title"])
+            log_message(f"Audio upgrade found for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score} using: {target['title']}")
+            
+            try:
+                dl_dir, v_path, v_name, v_size = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
+                size_mb = round(v_size / 1048576, 2)
+                upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
+                shutil.rmtree(dl_dir, ignore_errors=True)
 
-                    pd_id = upload["id"]
-                    pd_url = upload["url"]
-                    await execute_sql("""
-                        UPDATE episodes
-                        SET stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
-                            file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?
-                        WHERE id = ?
-                    """, [pd_url, pd_id, pd_url, pd_id, size_mb, target["magnet"], new_score, ep["ep_id"]])
+                if ep["pixeldrain_id"]:
+                    delete_from_pixeldrain(ep["pixeldrain_id"])
 
-                    log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
-                    break
-                except Exception as up_ex:
-                    log_message(f"Failed to apply audio upgrade for {romaji}: {up_ex}")
+                pd_id = upload["id"]
+                pd_url = upload["url"]
+                await execute_sql("""
+                    UPDATE episodes
+                    SET stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
+                        file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?
+                    WHERE id = ?
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, target["magnet"], new_score, ep["ep_id"]])
+
+                log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
+            except Exception as up_ex:
+                log_message(f"Failed to apply audio upgrade for {romaji}: {up_ex}")
 
 # ─── Main Entry Point ──────────────────────────────────────────
 async def main():
