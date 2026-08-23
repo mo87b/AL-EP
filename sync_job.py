@@ -524,31 +524,72 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
 async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> list:
     encoded_query = urllib.parse.quote(query)
     sources = [
-        {"type": "gas", "url": f"{GAS_PROXY_URL}?q={encoded_query}"},
-        {"type": "direct", "url": f"https://nyaa.si/?page=rss&q={encoded_query}"},
+        {"type": "rss", "url": f"{GAS_PROXY_URL}?q={encoded_query}"},
+        {"type": "rss", "url": f"https://nyaa.si/?page=rss&q={encoded_query}"},
+        {"type": "rss", "url": f"https://nyaa.site/?page=rss&q={encoded_query}"}
     ]
 
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
     for src in sources:
         try:
-            async with httpx.AsyncClient(timeout=20.0, headers=headers) as client:
+            await asyncio.sleep(0.3)
+            async with httpx.AsyncClient(timeout=25.0, headers=headers, follow_redirects=True) as client:
                 r = await client.get(src["url"])
-                if r.status_code == 200 and "<rss" in r.text:
-                    root = ET.fromstring(r.content)
-                    items = root.findall(".//item")
-                    matched = []
-                    for it in items:
-                        t = it.find("title").text
-                        m_link = it.find("link").text
-                        seeders_el = it.find("{https://nyaa.si/xmlns/nyaa}seeders")
-                        seeders = int(seeders_el.text) if seeders_el is not None and seeders_el.text.isdigit() else 0
-                        
+                if r.status_code == 200:
+                    raw_items = []
+                    if src.get("type") == "api" or (r.text.startswith("{") and "data" in r.text):
+                        data = r.json()
+                        items = data.get("data", [])
+                        for item in items:
+                            raw_items.append({
+                                "title": item.get("title", ""),
+                                "torrent": item.get("torrent", ""),
+                                "seeders": int(item.get("seeders") or 0)
+                            })
+                    elif "<rss" in r.text or "<item" in r.text:
+                        root = ET.fromstring(r.content)
+                        items = root.findall(".//item")
+                        for item in items:
+                            title_el = item.find("title")
+                            link_el = item.find("link")
+                            title = title_el.text if title_el is not None else ""
+                            torrent_url = link_el.text if link_el is not None else ""
+                            seeders = 0
+                            for child in item:
+                                if child.tag.endswith("seeders"):
+                                    seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
+                                    break
+                            raw_items.append({
+                                "title": title,
+                                "torrent": torrent_url,
+                                "seeders": seeders
+                            })
+
+                    results = []
+                    for item in raw_items:
+                        t = item["title"]
+                        torrent_url = item["torrent"]
+                        seeders = item["seeders"]
+                        if not t or not torrent_url:
+                            continue
+
                         if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
-                            matched.append({"title": t, "magnet": m_link, "seeders": seeders})
-                    if matched:
-                        return matched
-        except Exception as e:
+                            id_match = re.search(r'/(?:download|view)/(\d+)', torrent_url)
+                            if id_match:
+                                torrent_id = id_match.group(1)
+                            else:
+                                torrent_id = torrent_url.split('/')[-1].split('.')[0]
+
+                            torrent_source = f"https://nyaa.iss.one/download/{torrent_id}.torrent"
+                            results.append({
+                                "title": t,
+                                "magnet": torrent_source,
+                                "seeders": seeders
+                            })
+                    if results:
+                        return results
+        except Exception:
             pass
 
     return []
@@ -800,7 +841,29 @@ async def resolve_pending_episodes():
                 seen_magnets.add(r["magnet"])
                 deduped.append(r)
 
-        good = [r for r in deduped if r["seeders"] >= 1 and not is_blacklisted_platform(r["title"])]
+        now_ts = int(time.time())
+        aired_at = ep.get("aired_at") or 0
+        tier3_only = (aired_at > 0) and (now_ts - aired_at < 600)
+
+        def is_acceptable_torrent(t_title: str) -> bool:
+            if tier3_only:
+                return get_platform_score(t_title) >= 3
+            return True
+
+        def get_min_seeders_for_torrent(t_title: str) -> int:
+            is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_title.lower()))
+            if is_trusted and (aired_at > 0) and (now_ts - aired_at < 7200):
+                return 1
+            elif is_trusted:
+                return 2
+            return MIN_TORRENT_SEEDERS
+
+        good = [
+            r for r in deduped 
+            if r["seeders"] >= get_min_seeders_for_torrent(r["title"]) 
+            and is_acceptable_torrent(r["title"]) 
+            and not is_blacklisted_platform(r["title"])
+        ]
         if not good:
             log_message(f"No active torrents found yet for {romaji} Ep {ep_num}.")
             await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
