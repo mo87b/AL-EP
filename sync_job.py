@@ -18,9 +18,11 @@ TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")
 GAS_PROXY_URL = os.environ.get("GAS_PROXY_URL", "")
 
-MAX_DOWNLOADS_PER_RUN = 5
-TORRENT_DOWNLOAD_TIMEOUT = 300  # 5 minutes per download
-MIN_TORRENT_SEEDERS = 7
+SYNC_DAYS = int(os.environ.get("SYNC_DAYS", "12"))
+SYNC_SECONDS = SYNC_DAYS * 24 * 60 * 60
+MAX_DOWNLOADS_PER_RUN = int(os.environ.get("MAX_DOWNLOADS_PER_RUN", "5"))
+TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "300"))
+MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "7"))
 
 NYAA_TRACKERS = [
     "http://nyaa.tracker.wf:7777/announce",
@@ -89,9 +91,6 @@ async def execute_sql(sql: str, args: list = None) -> list:
         return _parse_turso_result(exec_result)
 
 async def execute_sql_batch(statements: list) -> list:
-    """Execute multiple SQL statements in a single HTTP request.
-    statements: list of (sql, args) tuples.
-    Returns list of results for each statement."""
     if not statements:
         return []
     requests = []
@@ -111,8 +110,51 @@ async def execute_sql_batch(statements: list) -> list:
             resp = result_obj.get("response", {})
             if resp.get("type") == "execute":
                 results.append(_parse_turso_result(resp.get("result", {})))
-            # skip "close" responses
         return results
+
+# ─── Database Maintenance & Blacklist ───────────────────────────
+async def ensure_database_schema():
+    await execute_sql("""
+        CREATE TABLE IF NOT EXISTS anime_blacklist (
+            anilist_id INTEGER PRIMARY KEY,
+            title_romaji TEXT,
+            reason TEXT,
+            blacklisted_at INTEGER
+        )
+    """)
+    for col in ["is_multi_audio INTEGER DEFAULT 0", "audio_score INTEGER DEFAULT 0", "erai_title TEXT", 
+                "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT"]:
+        try:
+            col_name = col.split()[0]
+            await execute_sql(f"ALTER TABLE episodes ADD COLUMN {col}")
+        except Exception:
+            pass
+
+    # Self-healing: Reset any stuck processing episodes from crashed runs
+    try:
+        affected = await execute_sql("UPDATE episodes SET status = 'pending' WHERE status = 'processing'")
+        if affected:
+            log_message("Reset stuck 'processing' episodes back to 'pending'.")
+    except Exception:
+        pass
+
+async def get_blacklisted_ids() -> set:
+    rows = await execute_sql("SELECT anilist_id FROM anime_blacklist")
+    return {r["anilist_id"] for r in rows} if rows else set()
+
+async def blacklist_anime(anime_id: int, anilist_id: int, title_romaji: str, reason: str):
+    now_ts = int(time.time())
+    await execute_sql("""
+        INSERT INTO anime_blacklist (anilist_id, title_romaji, reason, blacklisted_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(anilist_id) DO UPDATE SET
+            title_romaji = excluded.title_romaji,
+            reason = excluded.reason,
+            blacklisted_at = excluded.blacklisted_at
+    """, [anilist_id, title_romaji, reason, now_ts])
+    await execute_sql("DELETE FROM episodes WHERE anime_id = ?", [anime_id])
+    await execute_sql("DELETE FROM anime WHERE id = ?", [anime_id])
+    log_message(f"Blacklisted anime: {title_romaji} (Reason: {reason})")
 
 # ─── Title & Episode Parsing Functions ─────────────────────────
 def clean_title(title: str) -> str:
@@ -122,8 +164,7 @@ def clean_title(title: str) -> str:
     title = re.sub(r'\[.*?\]', '', title)
     title = re.sub(r'[:\\/*?"<>|]', ' ', title)
     title = re.sub(r'[^a-zA-Z0-9\s\-\'\.]', '', title)
-    title = re.sub(r'\s+', ' ', title).strip()
-    return title
+    return re.sub(r'\s+', ' ', title).strip()
 
 def clean_and_strip(title: str) -> str:
     t = clean_title(title)
@@ -134,23 +175,26 @@ def clean_and_strip(title: str) -> str:
     t = re.sub(r'\bs\d+\b', '', t, flags=re.IGNORECASE)
     return re.sub(r'\s+', ' ', t).strip()
 
+def parse_erai_anime_title(filename: str) -> str:
+    if not filename or not isinstance(filename, str):
+        return ""
+    m = re.match(r'^\[Erai-raws\]\s+(.*?)\s+-\s+\d+', filename)
+    return m.group(1).strip() if m else ""
+
 def get_part_number(title: str) -> int:
     if not title or not isinstance(title, str):
         return 0
     t_lower = title.lower()
     
-    # Check Roman numerals (e.g. Part II, Cour III)
     m = re.search(r'\b(?:part|cour|pt)\s*[-_.: ]*\s*(iv|iii|ii|i)\b', t_lower)
     if m:
         roman_map = {'i': 1, 'ii': 2, 'iii': 3, 'iv': 4}
         return roman_map.get(m.group(1), 0)
     
-    # Check Ordinal variations (e.g. 2nd Part, 2nd Cour)
     m = re.search(r'\b(\d+)(st|nd|rd|th)\s+(?:part|cour|pt)\b', t_lower)
     if m:
         return int(m.group(1))
 
-    # Check Numeric variations (e.g. Part 2, Part-2, Cour.2)
     m = re.search(r'\b(?:part|cour|pt)\s*[-_.: ]*\s*0*(\d+)\b', t_lower)
     if m:
         return int(m.group(1))
@@ -212,6 +256,9 @@ def get_audio_score(title: str) -> int:
         return 1
     return 0
 
+def is_multi_audio_torrent(title: str) -> bool:
+    return get_audio_score(title) > 0
+
 def get_platform_score(title: str) -> int:
     if not title or not isinstance(title, str):
         return 0
@@ -246,7 +293,6 @@ def get_source_weight(title: str) -> int:
         return 1
     return 0
 
-# Comprehensive words to ignore during title match to avoid failing on season tokens or release formats
 SEASON_STOPWORDS = {
     "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th",
     "season", "cour", "part", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9",
@@ -269,8 +315,7 @@ def get_clean_words(title: str) -> list:
     title_lower = title.lower()
     title_no_se = re.sub(r'\b(s\d+e\d+|s\d+|e\d+)\b', ' ', title_lower)
     title_no_num = re.sub(r'\b\d+\b', ' ', title_no_se)
-    clean_t = title_no_num.replace('.', ' ').replace('-', ' ')
-    clean_t = clean_t.replace("'", "")
+    clean_t = title_no_num.replace('.', ' ').replace('-', ' ').replace("'", "")
     clean_t = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_t)
     words = clean_t.split()
     
@@ -282,13 +327,9 @@ def get_clean_words(title: str) -> list:
     filtered = []
     for w in words:
         w_stripped = w.strip("-'")
-        if not w_stripped:
+        if not w_stripped or w_stripped in SEASON_STOPWORDS or w_stripped in particles:
             continue
-        if w_stripped in SEASON_STOPWORDS or w_stripped in particles:
-            continue
-        if len(w_stripped) >= 2:
-            filtered.append(w_stripped)
-        elif len(words) == 1:
+        if len(w_stripped) >= 2 or len(words) == 1:
             filtered.append(w_stripped)
     return filtered
 
@@ -370,11 +411,7 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
 
     romaji_match = is_title_match(romaji, t_lower)
     eng_match = is_title_match(english, t_lower) if english else False
-    syn_match = False
-    for syn in synonyms:
-        if syn and is_title_match(syn, t_lower):
-            syn_match = True
-            break
+    syn_match = any(is_title_match(syn, t_lower) for syn in synonyms if syn)
 
     if not romaji_match and not eng_match and not syn_match:
         return False
@@ -385,10 +422,7 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
         torrent_clean = clean_title(torrent_title)
         torrent_words = get_clean_words(torrent_clean)
         
-        anime_words = set()
-        anime_words.update(get_clean_words(romaji))
-        if english:
-            anime_words.update(get_clean_words(english))
+        anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
         for syn in synonyms:
             if syn:
                 anime_words.update(get_clean_words(syn))
@@ -406,11 +440,9 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
                 continue
             is_concat = False
             for w1 in anime_words:
-                if len(w1) >= 3 and w.startswith(w1):
-                    remainder = w[len(w1):]
-                    if remainder in anime_words:
-                        is_concat = True
-                        break
+                if len(w1) >= 3 and w.startswith(w1) and w[len(w1):] in anime_words:
+                    is_concat = True
+                    break
             if not is_concat:
                 extra_words.append(w)
                 
@@ -427,12 +459,9 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
         r'\[multiple[-_ ]?subtitles?\]',
         t_lower
     ))
-    if not is_multi_sub:
-        return False
+    return is_multi_sub
 
-    return True
-
-def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> list:
+def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False, erai_title: str = None) -> list:
     queries = []
     ep_str = f"{ep:02d}"
     synonyms = synonyms or []
@@ -448,11 +477,12 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
         e_super = re.sub(r'[\-\.]', ' ', e_base).replace("'", "")
         e_super = re.sub(r'\s+', ' ', e_super).strip()
     
-    search_bases = [r_base]
+    search_bases = []
+    if erai_title:
+        search_bases.append(clean_and_strip(erai_title))
+    search_bases.extend([r_base, e_base])
     if r_super and r_super not in search_bases:
         search_bases.append(r_super)
-    if e_base and e_base not in search_bases:
-        search_bases.append(e_base)
     if e_super and e_super not in search_bases:
         search_bases.append(e_super)
         
@@ -460,10 +490,6 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
         cleaned_syn = clean_and_strip(syn)
         if cleaned_syn and cleaned_syn not in search_bases:
             search_bases.append(cleaned_syn)
-        syn_super = re.sub(r'[\-\.]', ' ', cleaned_syn).replace("'", "")
-        syn_super = re.sub(r'\s+', ' ', syn_super).strip()
-        if syn_super and syn_super not in search_bases:
-            search_bases.append(syn_super)
             
     for base in search_bases:
         if not base:
@@ -494,15 +520,11 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
             if var != base_romaji_clean:
                 queries.append(f'{var} "{ep_str}"')
                 queries.append(f'{var} {ep_str}')
-                if is_special and ep == 1:
-                    queries.append(var)
                 words = var.split()
                 if len(words) > 3:
                     short_var = " ".join(words[:3])
                     queries.append(f'{short_var} "{ep_str}"')
                     queries.append(f'{short_var} {ep_str}')
-                    if is_special and ep == 1:
-                        queries.append(short_var)
                     
         r_words = base_romaji_clean.split()
         if len(r_words) >= 2:
@@ -599,22 +621,37 @@ def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
     download_dir = tempfile.mkdtemp(prefix="anime_")
     torrent_file_path = os.path.join(download_dir, "download.torrent")
     
-    # If source is HTTP .torrent URL, download through GAS proxy
     if magnet_url.startswith("http"):
-        gas_url = f"{GAS_PROXY_URL}?mode=torrent&url={urllib.parse.quote(magnet_url)}"
+        # 1. Try direct issuance mirror download first
+        downloaded = False
         try:
-            with httpx.Client(timeout=30.0) as client:
-                r = client.get(gas_url)
-                if r.status_code == 200 and r.json().get("status") == 200:
-                    import base64
-                    raw_bytes = base64.b64decode(r.json()["data"])
+            with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+                r = client.get(magnet_url)
+                if r.status_code == 200:
                     with open(torrent_file_path, "wb") as f:
-                        f.write(raw_bytes)
+                        f.write(r.content)
                     torrent_input = torrent_file_path
-                else:
-                    torrent_input = magnet_url
+                    downloaded = True
         except Exception:
-            torrent_input = magnet_url
+            pass
+
+        # 2. Fallback to GAS proxy base64 download
+        if not downloaded:
+            gas_target_url = magnet_url.replace("nyaa.iss.one", "nyaa.si").replace("nyaa.site", "nyaa.si")
+            gas_url = f"{GAS_PROXY_URL}?mode=torrent&url={urllib.parse.quote(gas_target_url)}"
+            try:
+                with httpx.Client(timeout=30.0) as client:
+                    r = client.get(gas_url)
+                    if r.status_code == 200 and r.json().get("status") == 200:
+                        import base64
+                        raw_bytes = base64.b64decode(r.json()["data"])
+                        with open(torrent_file_path, "wb") as f:
+                            f.write(raw_bytes)
+                        torrent_input = torrent_file_path
+                    else:
+                        torrent_input = magnet_url
+            except Exception:
+                torrent_input = magnet_url
     else:
         torrent_input = magnet_url
 
@@ -637,11 +674,10 @@ def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
         shutil.rmtree(download_dir, ignore_errors=True)
         raise RuntimeError(f"aria2c failed with code {proc.returncode}")
 
-    # Find largest video file in download directory
     video_files = []
     for root, _, files in os.walk(download_dir):
         for f in files:
-            if f.endswith((".mkv", ".mp4", ".avi")):
+            if f.endswith((".mkv", ".mp4", ".avi", ".webm")) and not f.endswith((".aria2", ".torrent")):
                 fp = os.path.join(root, f)
                 video_files.append((fp, f, os.path.getsize(fp)))
 
@@ -655,13 +691,12 @@ def download_torrent(magnet_url: str, torrent_title: str) -> tuple:
 
 def upload_pixeldrain(file_path: str, filename: str) -> dict:
     url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
-    headers = {}
     auth = ("", PIXELDRAIN_API_KEY) if PIXELDRAIN_API_KEY else None
 
     log_message(f"Uploading {filename}...")
     with open(file_path, "rb") as f:
         with httpx.Client(timeout=300.0) as client:
-            r = client.put(url, content=f.read(), auth=auth, headers=headers)
+            r = client.put(url, content=f.read(), auth=auth)
             if r.status_code in [200, 201]:
                 file_id = r.json().get("id")
                 return {"id": file_id, "url": f"https://pixeldrain.com/api/file/{file_id}"}
@@ -677,6 +712,38 @@ def delete_from_pixeldrain(file_id: str) -> bool:
             return r.status_code == 200
     except Exception:
         return False
+
+async def cleanup_pixeldrain_duplicates():
+    if not PIXELDRAIN_API_KEY:
+        return
+    try:
+        url = "https://pixeldrain.com/api/user/files"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.get(url, auth=("", PIXELDRAIN_API_KEY))
+            if r.status_code == 200:
+                files = r.json().get("files", [])
+                by_name = {}
+                for f in files:
+                    name = f.get("name", "")
+                    fid = f.get("id")
+                    if name and fid:
+                        by_name.setdefault(name, []).append(f)
+                
+                to_delete = []
+                saved_bytes = 0
+                for name, flist in by_name.items():
+                    if len(flist) > 1:
+                        flist.sort(key=lambda x: x.get("date_upload", ""))
+                        for dup in flist[1:]:
+                            to_delete.append(dup["id"])
+                            saved_bytes += dup.get("size", 0)
+                
+                if to_delete:
+                    for fid in to_delete:
+                        await client.delete(f"https://pixeldrain.com/api/file/{fid}", auth=("", PIXELDRAIN_API_KEY))
+                    log_message(f"Storage Cleanup: Purged {len(to_delete)} duplicate files ({saved_bytes / 1073741824:.2f} GB reclaimed).")
+    except Exception:
+        pass
 
 # ─── AniList Schedule Syncing ──────────────────────────────────
 ANILIST_SCHEDULE_QUERY = """
@@ -699,6 +766,7 @@ query ($page: Int, $airingAt_greater: Int, $airingAt_lesser: Int) {
         season
         seasonYear
         format
+        startDate { year }
       }
     }
   }
@@ -708,7 +776,8 @@ query ($page: Int, $airingAt_greater: Int, $airingAt_lesser: Int) {
 async def sync_anilist_schedule():
     log_message("Syncing schedule...")
     now = int(time.time())
-    twelve_days_ago = now - (12 * 24 * 60 * 60)
+    twelve_days_ago = now - SYNC_SECONDS
+    blacklisted = await get_blacklisted_ids()
     page = 1
     has_next = True
 
@@ -726,13 +795,22 @@ async def sync_anilist_schedule():
                 if not schedules:
                     break
 
-                # Batch all upserts for this page into a single Turso HTTP call
                 batch_stmts = []
                 for item in schedules:
-                    ep_num = item["episode"]
-                    airing_ts = item["airingAt"]
                     m = item["media"]
                     anilist_id = m["id"]
+                    if anilist_id in blacklisted:
+                        continue
+
+                    # Filter blocked formats or genres
+                    format_type = m.get("format") or "TV"
+                    if format_type not in ["TV", "TV_SHORT", "MOVIE", "SPECIAL", "OVA", "ONA"]:
+                        continue
+
+                    genres_list = m.get("genres") or []
+                    if any(str(g).lower() in {"hentai", "ecchi"} for g in genres_list):
+                        continue
+
                     romaji = m["title"]["romaji"] or ""
                     english = m["title"]["english"] or ""
                     native = m["title"]["native"] or ""
@@ -740,8 +818,7 @@ async def sync_anilist_schedule():
                     cover_url = m.get("coverImage", {}).get("large") or ""
                     banner_url = m.get("bannerImage") or ""
                     synopsis = m.get("description") or ""
-                    genres = json.dumps(m.get("genres") or [])
-                    format_type = m.get("format") or "TV"
+                    genres = json.dumps(genres_list)
 
                     batch_stmts.append(("""
                         INSERT INTO anime (anilist_id, title_romaji, title_english, title_native, synonyms, 
@@ -755,14 +832,15 @@ async def sync_anilist_schedule():
                             status = 'RELEASING'
                     """, [anilist_id, romaji, english, native, synonyms, cover_url, banner_url, synopsis, genres, format_type]))
 
-                # Execute all anime upserts in one batch
-                await execute_sql_batch(batch_stmts)
+                if batch_stmts:
+                    await execute_sql_batch(batch_stmts)
 
-                # Now batch episode inserts (need anime IDs first)
                 ep_batch = []
                 for item in schedules:
                     m = item["media"]
                     anilist_id = m["id"]
+                    if anilist_id in blacklisted:
+                        continue
                     ep_num = item["episode"]
                     airing_ts = item["airingAt"]
                     ep_batch.append(("""
@@ -771,7 +849,8 @@ async def sync_anilist_schedule():
                         ON CONFLICT(anime_id, episode_number) DO NOTHING
                     """, [anilist_id, ep_num, airing_ts]))
 
-                await execute_sql_batch(ep_batch)
+                if ep_batch:
+                    await execute_sql_batch(ep_batch)
                 log_message(f"Page {page}: synced {len(schedules)} entries.")
 
                 has_next = data.get("pageInfo", {}).get("hasNextPage", False)
@@ -781,15 +860,65 @@ async def sync_anilist_schedule():
             log_message(f"Schedule sync error on page {page}: {e}")
             break
 
+# ─── Finished Anime Catch-up ───────────────────────────────────
+async def check_finished_anime_catchup():
+    """Checks actively-tracked anime that finished with missing final episodes on AniList."""
+    tracked_anime = await execute_sql("""
+        SELECT a.id, a.anilist_id, a.title_romaji, COUNT(e.id) as ready_count, MAX(e.episode_number) as max_ep
+        FROM anime a
+        JOIN episodes e ON a.id = e.anime_id
+        WHERE e.status = 'ready' AND a.status = 'RELEASING'
+        GROUP BY a.id
+        HAVING ready_count >= 3
+    """)
+
+    if not tracked_anime:
+        return
+
+    anilist_ids = [r["anilist_id"] for r in tracked_anime if r.get("anilist_id")]
+    aid_map = {r["anilist_id"]: r for r in tracked_anime}
+
+    query = """
+    query ($ids: [Int], $page: Int) {
+      Page(page: $page, perPage: 50) {
+        media(id_in: $ids, status: FINISHED) {
+          id
+          episodes
+        }
+        pageInfo { hasNextPage }
+      }
+    }
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            r = await client.post("https://graphql.anilist.co", json={"query": query, "variables": {"ids": anilist_ids, "page": 1}})
+            if r.status_code == 200:
+                finished = r.json().get("data", {}).get("Page", {}).get("media", [])
+                now_ts = int(time.time())
+                for item in finished:
+                    aid_info = aid_map.get(item["id"])
+                    if not aid_info:
+                        continue
+                    total_eps = item.get("episodes") or 0
+                    max_ep = aid_info["max_ep"] or 0
+                    if total_eps > max_ep:
+                        for missing_ep in range(max_ep + 1, total_eps + 1):
+                            await execute_sql("""
+                                INSERT INTO episodes (anime_id, episode_number, status, aired_at)
+                                VALUES (?, ?, 'pending', ?)
+                                ON CONFLICT(anime_id, episode_number) DO NOTHING
+                            """, [aid_info["id"], missing_ep, now_ts])
+                        log_message(f"Catch-up: Queued missing episodes {max_ep+1}-{total_eps} for finished anime {aid_info['title_romaji']}")
+    except Exception:
+        pass
+
 # ─── Main Episode Resolution Loop ─────────────────────────────
 async def resolve_pending_episodes():
     log_message("Resolving pending episodes...")
-    # Only get the LOWEST pending episode per anime (no point searching Ep 337 if Ep 1-336 aren't done)
-    # Also only consider episodes aired in the last 14 days to avoid searching for ancient backlog
     cutoff_ts = int(time.time()) - (14 * 24 * 60 * 60)
     pending_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.status, e.aired_at, e.last_checked,
-               a.title_romaji, a.title_english, a.synonyms, a.format
+               a.anilist_id, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'pending'
@@ -814,14 +943,25 @@ async def resolve_pending_episodes():
             break
 
         ep_id = ep["ep_id"]
+        anime_id = ep["anime_id"]
+        anilist_id = ep.get("anilist_id")
         ep_num = ep["episode_number"]
         romaji = ep["title_romaji"]
         english = ep["title_english"]
+        erai_title = ep.get("erai_title")
         synonyms = json.loads(ep["synonyms"]) if ep["synonyms"] else []
         is_special = ep["format"] in ["SPECIAL", "MOVIE", "OVA", "ONA"]
 
+        now_ts = int(time.time())
+        aired_at = ep.get("aired_at") or 0
+
+        # Non-translated anime check: if Ep 1 aired > 5 days ago and was never found, blacklist
+        if ep_num == 1 and aired_at > 0 and (now_ts - aired_at > 5 * 86400):
+            await blacklist_anime(anime_id, anilist_id, romaji, "first_episode_grace_expired")
+            continue
+
         log_message(f"Searching torrents for: {romaji} (Ep {ep_num})")
-        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special)
+        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special, erai_title=erai_title)
         
         all_results = []
         for i, q in enumerate(queries):
@@ -841,8 +981,6 @@ async def resolve_pending_episodes():
                 seen_magnets.add(r["magnet"])
                 deduped.append(r)
 
-        now_ts = int(time.time())
-        aired_at = ep.get("aired_at") or 0
         tier3_only = (aired_at > 0) and (now_ts - aired_at < 600)
 
         def is_acceptable_torrent(t_title: str) -> bool:
@@ -869,7 +1007,7 @@ async def resolve_pending_episodes():
             await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
             continue
 
-        # Smart Sort
+        # Smart Sort: Multi-Audio > Trusted Groups > Platform Score > Quality > Source > Seeders
         good.sort(key=lambda x: (
             get_audio_score(x["title"]),
             1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
@@ -913,6 +1051,14 @@ async def resolve_pending_episodes():
                 WHERE id = ?
             """, [pd_url, pd_id, pd_url, pd_id, size_mb, winner["magnet"], is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
 
+            # Timer reset: refresh aired_at for sibling pending episodes of this anime
+            await execute_sql("UPDATE episodes SET aired_at = ? WHERE anime_id = ? AND status = 'pending'", [now_ts, anime_id])
+
+            # Store parsed erai_title for future searches
+            parsed_erai = parse_erai_anime_title(v_name)
+            if parsed_erai and not erai_title:
+                await execute_sql("UPDATE anime SET erai_title = ? WHERE id = ?", [parsed_erai, anime_id])
+
             log_message(f"Successfully processed {romaji} Ep {ep_num}")
             downloads_count += 1
 
@@ -925,7 +1071,7 @@ async def check_audio_upgrades():
     log_message("Checking for quality upgrades...")
     recent_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.audio_score, e.uploaded_at,
-               a.title_romaji, a.title_english, a.synonyms, a.format
+               a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'ready' AND (e.audio_score < 2 OR e.audio_score IS NULL)
@@ -937,10 +1083,11 @@ async def check_audio_upgrades():
         current_audio = ep["audio_score"] or 0
         romaji = ep["title_romaji"]
         english = ep["title_english"]
+        erai_title = ep.get("erai_title")
         ep_num = ep["episode_number"]
         synonyms = json.loads(ep["synonyms"]) if ep["synonyms"] else []
 
-        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms)
+        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, erai_title=erai_title)
         for q in queries[:4]:
             results = await search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms)
             better = [r for r in results if get_audio_score(r["title"]) > current_audio and r["seeders"] >= 1]
@@ -956,7 +1103,6 @@ async def check_audio_upgrades():
                     upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
                     shutil.rmtree(dl_dir, ignore_errors=True)
 
-                    # Delete old file
                     if ep["pixeldrain_id"]:
                         delete_from_pixeldrain(ep["pixeldrain_id"])
 
@@ -978,7 +1124,10 @@ async def check_audio_upgrades():
 async def main():
     log_message("=== Starting Data Sync Pipeline ===")
     t0 = time.time()
+    await ensure_database_schema()
+    await cleanup_pixeldrain_duplicates()
     await sync_anilist_schedule()
+    await check_finished_anime_catchup()
     await resolve_pending_episodes()
     await check_audio_upgrades()
     elapsed = round(time.time() - t0, 1)
