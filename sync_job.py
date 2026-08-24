@@ -10,6 +10,7 @@ import datetime
 import subprocess
 import urllib.parse
 import xml.etree.ElementTree as ET
+import email.utils
 import httpx
 
 # ─── Environment Configuration ──────────────────────────────────
@@ -598,7 +599,8 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                         raw_items.append({
                             "title": item.get("title", ""),
                             "torrent": item.get("torrent", ""),
-                            "seeders": int(item.get("seeders") or 0)
+                            "seeders": int(item.get("seeders") or 0),
+                            "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
                         })
                 elif "<rss" in r.text or "<item" in r.text:
                     root = ET.fromstring(r.content)
@@ -606,8 +608,15 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                     for item in items:
                         title_el = item.find("title")
                         link_el = item.find("link")
+                        pub_el = item.find("pubDate")
                         title = title_el.text if title_el is not None else ""
                         torrent_url = link_el.text if link_el is not None else ""
+                        pub_date_ts = 0
+                        if pub_el is not None and pub_el.text:
+                            try:
+                                pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
+                            except Exception:
+                                pub_date_ts = 0
                         seeders = 0
                         for child in item:
                             if child.tag.endswith("seeders"):
@@ -616,7 +625,8 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                         raw_items.append({
                             "title": title,
                             "torrent": torrent_url,
-                            "seeders": seeders
+                            "seeders": seeders,
+                            "pub_date": pub_date_ts
                         })
 
                 results = []
@@ -624,6 +634,7 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                     t = item["title"]
                     torrent_url = item["torrent"]
                     seeders = item["seeders"]
+                    pub_date = item.get("pub_date", 0)
                     if not t or not torrent_url:
                         continue
 
@@ -631,7 +642,8 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                         results.append({
                             "title": t,
                             "magnet": torrent_url,
-                            "seeders": seeders
+                            "seeders": seeders,
+                            "pub_date": pub_date
                         })
                 if results:
                     return results
@@ -1031,11 +1043,21 @@ async def resolve_pending_episodes():
                 return 2
             return MIN_TORRENT_SEEDERS
 
+        # Date sanity check: If torrent was published on Nyaa > 5 days BEFORE AniList airing date, it is an outdated/false-positive match
+        def is_valid_release_date(t_pub_date: int, ep_aired_at: int) -> bool:
+            if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
+                return True
+            # Allow up to 5 days earlier in case of AniList slight schedule delay/early leaks
+            if t_pub_date < (ep_aired_at - 5 * 86400):
+                return False
+            return True
+
         good = [
             r for r in deduped 
             if r["seeders"] >= get_min_seeders_for_torrent(r["title"]) 
             and is_acceptable_torrent(r["title"]) 
             and not is_blacklisted_platform(r["title"])
+            and is_valid_release_date(r.get("pub_date", 0), aired_at)
         ]
         if not good:
             log_message(f"No active torrents found yet for {romaji} Ep {ep_num}.")
