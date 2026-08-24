@@ -1043,12 +1043,12 @@ async def resolve_pending_episodes():
                 return 2
             return MIN_TORRENT_SEEDERS
 
-        # Date sanity check: If torrent was published on Nyaa > 5 days BEFORE AniList airing date, it is an outdated/false-positive match
+        # Date sanity check: If torrent was published on Nyaa > 7 days BEFORE AniList airing date, it is an outdated/false-positive match
         def is_valid_release_date(t_pub_date: int, ep_aired_at: int) -> bool:
             if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
                 return True
-            # Allow up to 5 days earlier in case of AniList slight schedule delay/early leaks
-            if t_pub_date < (ep_aired_at - 5 * 86400):
+            # Allow up to 7 days earlier in case of AniList slight schedule delay/early leaks
+            if t_pub_date < (ep_aired_at - 7 * 86400):
                 return False
             return True
 
