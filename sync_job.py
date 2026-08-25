@@ -501,6 +501,17 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
     ))
     return is_multi_sub
 
+def _title_segments(title: str) -> list:
+    """Colon/dash-separated title parts that can stand alone in search."""
+    segs = []
+    if not title or not isinstance(title, str):
+        return segs
+    for part in re.split(r':|\s+-\s+', title):
+        cleaned = clean_and_strip(part)
+        if cleaned and len(cleaned.split()) >= 2 and cleaned not in segs:
+            segs.append(cleaned)
+    return segs[:4]
+
 def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False, erai_title: str = None) -> list:
     queries = []
     ep_str = f"{ep:02d}"
@@ -520,6 +531,10 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
     search_bases = []
     if erai_title:
         search_bases.append(clean_and_strip(erai_title))
+    for source_title in (romaji, english):
+        for seg in _title_segments(source_title):
+            if seg not in search_bases:
+                search_bases.append(seg)
     search_bases.extend([r_base, e_base])
     if r_super and r_super not in search_bases:
         search_bases.append(r_super)
@@ -583,74 +598,93 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
     return list(dict.fromkeys(queries))
 
 # ─── Nyaa Search & Proxy Integration ──────────────────────────
-async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> list:
+async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> tuple:
+    """Returns (results, diagnostic_note). note is empty when results were found."""
     encoded_query = urllib.parse.quote(query)
     url = f"{GAS_PROXY_URL}?q={encoded_query}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    tag = query[:40].replace("\n", " ")
 
     try:
         async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
             r = await client.get(url)
-            if r.status_code == 200:
-                raw_items = []
-                if r.text.startswith("{") and "data" in r.text:
+            if r.status_code != 200:
+                return [], f"'{tag}' proxy HTTP {r.status_code}"
+
+            raw_items = []
+            text = r.text
+            if text.startswith("{"):
+                try:
                     data = r.json()
-                    for item in data.get("data", []):
-                        raw_items.append({
-                            "title": item.get("title", ""),
-                            "torrent": item.get("torrent", ""),
-                            "seeders": int(item.get("seeders") or 0),
-                            "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
-                        })
-                elif "<rss" in r.text or "<item" in r.text:
+                except Exception:
+                    return [], f"'{tag}' invalid JSON body"
+                payload = data.get("data")
+                if not isinstance(payload, list):
+                    return [], f"'{tag}' proxy error payload ({data.get('error') or data.get('status')})"
+                for item in payload:
+                    raw_items.append({
+                        "title": item.get("title", ""),
+                        "torrent": item.get("torrent", ""),
+                        "seeders": int(item.get("seeders") or 0),
+                        "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
+                    })
+            elif "<rss" in text or "<item" in text:
+                try:
                     root = ET.fromstring(r.content)
-                    items = root.findall(".//item")
-                    for item in items:
-                        title_el = item.find("title")
-                        link_el = item.find("link")
-                        pub_el = item.find("pubDate")
-                        title = title_el.text if title_el is not None else ""
-                        torrent_url = link_el.text if link_el is not None else ""
-                        pub_date_ts = 0
-                        if pub_el is not None and pub_el.text:
-                            try:
-                                pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
-                            except Exception:
-                                pub_date_ts = 0
-                        seeders = 0
-                        for child in item:
-                            if child.tag.endswith("seeders"):
-                                seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
-                                break
-                        raw_items.append({
-                            "title": title,
-                            "torrent": torrent_url,
-                            "seeders": seeders,
-                            "pub_date": pub_date_ts
-                        })
+                except ET.ParseError:
+                    return [], f"'{tag}' unparsable XML body"
+                items = root.findall(".//item")
+                for item in items:
+                    title_el = item.find("title")
+                    link_el = item.find("link")
+                    pub_el = item.find("pubDate")
+                    title = title_el.text if title_el is not None else ""
+                    torrent_url = link_el.text if link_el is not None else ""
+                    pub_date_ts = 0
+                    if pub_el is not None and pub_el.text:
+                        try:
+                            pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
+                        except Exception:
+                            pub_date_ts = 0
+                    seeders = 0
+                    for child in item:
+                        if child.tag.endswith("seeders"):
+                            seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
+                            break
+                    raw_items.append({
+                        "title": title,
+                        "torrent": torrent_url,
+                        "seeders": seeders,
+                        "pub_date": pub_date_ts
+                    })
+            else:
+                body_head = text.strip()[:50].replace("\n", " ")
+                return [], f"'{tag}' unexpected body: {body_head!r}"
 
-                results = []
-                for item in raw_items:
-                    t = item["title"]
-                    torrent_url = item["torrent"]
-                    seeders = item["seeders"]
-                    pub_date = item.get("pub_date", 0)
-                    if not t or not torrent_url:
-                        continue
+            if not raw_items:
+                return [], f"'{tag}' raw=0"
 
-                    if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
-                        results.append({
-                            "title": t,
-                            "magnet": torrent_url,
-                            "seeders": seeders,
-                            "pub_date": pub_date
-                        })
-                if results:
-                    return results
-    except Exception:
-        pass
+            results = []
+            for item in raw_items:
+                t = item["title"]
+                torrent_url = item["torrent"]
+                seeders = item["seeders"]
+                pub_date = item.get("pub_date", 0)
+                if not t or not torrent_url:
+                    continue
 
-    return []
+                if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
+                    results.append({
+                        "title": t,
+                        "magnet": torrent_url,
+                        "seeders": seeders,
+                        "pub_date": pub_date
+                    })
+            if results:
+                return results, ""
+            return [], f"'{tag}' raw={len(raw_items)} matched=0"
+    except Exception as e:
+        return [], f"'{tag}' {type(e).__name__}"
 
 # ─── aria2c Downloader & Pixeldrain Uploader ──────────────────
 def is_valid_torrent_data(data: bytes) -> bool:
@@ -1005,6 +1039,7 @@ async def resolve_pending_episodes():
         queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special, erai_title=erai_title)
         
         all_results = []
+        search_notes = []
         for i in range(0, min(len(queries), 6), 2):
             batch = queries[i:i+2]
             tasks = [
@@ -1012,8 +1047,14 @@ async def resolve_pending_episodes():
                 for q in batch
             ]
             batch_res = await asyncio.gather(*tasks, return_exceptions=True)
-            for res_list in batch_res:
-                if isinstance(res_list, list) and res_list:
+            for res in batch_res:
+                if isinstance(res, Exception):
+                    search_notes.append(f"task {type(res).__name__}")
+                    continue
+                res_list, res_note = res
+                if res_note:
+                    search_notes.append(res_note)
+                if res_list:
                     all_results.extend(res_list)
             if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', r["title"].lower())) for r in all_results):
                 break
@@ -1060,7 +1101,11 @@ async def resolve_pending_episodes():
             and is_valid_release_date(r.get("pub_date", 0), aired_at)
         ]
         if not good:
-            log_message(f"No active torrents found yet for {romaji} Ep {ep_num}.")
+            hint = ""
+            if search_notes:
+                unique_notes = list(dict.fromkeys(search_notes))
+                hint = f" [{len(search_notes)} empty queries | {'; '.join(unique_notes[:3])}]"
+            log_message(f"No active torrents found yet for {romaji} Ep {ep_num}.{hint}")
             await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
             continue
 
@@ -1150,8 +1195,11 @@ async def check_audio_upgrades():
             batch = queries[i:i+2]
             tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms) for q in batch]
             batch_res = await asyncio.gather(*tasks, return_exceptions=True)
-            for res_list in batch_res:
-                if isinstance(res_list, list) and res_list:
+            for res in batch_res:
+                if isinstance(res, Exception):
+                    continue
+                res_list, _ = res
+                if res_list:
                     for r in res_list:
                         if get_audio_score(r["title"]) > current_audio and r.get("seeders", 0) >= 1:
                             better.append(r)
