@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import asyncio
 import datetime
+import hashlib
 import subprocess
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -597,6 +598,48 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
 
     return list(dict.fromkeys(queries))
 
+def extract_info_hash(payload: bytes) -> str:
+    """SHA-1 of the raw bencoded 'info' dictionary of a .torrent file."""
+    try:
+        data = payload
+
+        def read_str(i):
+            colon = data.index(b":", i)
+            length = int(data[i:colon])
+            start = colon + 1
+            return start, start + length
+
+        def skip(i):
+            c = data[i:i+1]
+            if c == b"i":
+                end = data.index(b"e", i)
+                return end + 1
+            if c in (b"d", b"l"):
+                i += 1
+                is_dict = c == b"d"
+                while data[i:i+1] != b"e":
+                    if is_dict:
+                        _, i = read_str(i)
+                    i = skip(i)
+                return i + 1
+            _, end = read_str(i)
+            return end
+
+        if data[:1] != b"d":
+            return None
+        i = 1
+        while data[i:i+1] != b"e":
+            ks, ke = read_str(i)
+            key = data[ks:ke]
+            val_start = ke
+            val_end = skip(val_start)
+            if key == b"info":
+                return hashlib.sha1(data[val_start:val_end]).hexdigest()
+            i = val_end
+    except Exception:
+        return None
+    return None
+
 # ─── Nyaa Search & Proxy Integration ──────────────────────────
 async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> tuple:
     """Returns (results, diagnostic_note). note is empty when results were found."""
@@ -699,7 +742,8 @@ def is_valid_torrent_data(data: bytes) -> bool:
 def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     download_dir = tempfile.mkdtemp(prefix="anime_")
     torrent_file_path = os.path.join(download_dir, "download.torrent")
-    
+    raw_payload = None
+
     # 1. Download .torrent file directly through Google Apps Script Proxy
     if torrent_source.startswith("http"):
         gas_url = f"{GAS_PROXY_URL}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
@@ -714,6 +758,7 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
                         if is_valid_torrent_data(raw_bytes):
                             with open(torrent_file_path, "wb") as f:
                                 f.write(raw_bytes)
+                            raw_payload = raw_bytes
                             torrent_input = torrent_file_path
                         else:
                             torrent_input = torrent_source
@@ -762,7 +807,8 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
 
     video_files.sort(key=lambda x: x[2], reverse=True)
     best_file = video_files[0]
-    return download_dir, best_file[0], best_file[1], best_file[2]
+    info_hash = extract_info_hash(raw_payload) if raw_payload else None
+    return download_dir, best_file[0], best_file[1], best_file[2], info_hash
 
 def upload_pixeldrain(file_path: str, filename: str) -> dict:
     url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
@@ -1127,8 +1173,12 @@ async def resolve_pending_episodes():
         log_message(f"Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio Score: {audio_score})")
 
         try:
-            dl_dir, v_path, v_name, v_size = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
+            dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
             size_mb = round(v_size / 1048576, 2)
+            stored_source = (
+                f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(torrent_title)}"
+                if info_hash else winner["magnet"]
+            )
 
             upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
             shutil.rmtree(dl_dir, ignore_errors=True)
@@ -1151,7 +1201,7 @@ async def resolve_pending_episodes():
                     uploaded_at = ?,
                     last_checked = ?
                 WHERE id = ?
-            """, [pd_url, pd_id, pd_url, pd_id, size_mb, winner["magnet"], is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
+            """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
 
             # Timer reset: refresh aired_at for sibling pending episodes of this anime
             await execute_sql("UPDATE episodes SET aired_at = ? WHERE anime_id = ? AND status = 'pending'", [now_ts, anime_id])
@@ -1213,8 +1263,12 @@ async def check_audio_upgrades():
             log_message(f"Audio upgrade found for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score} using: {target['title']}")
             
             try:
-                dl_dir, v_path, v_name, v_size = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
+                dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
                 size_mb = round(v_size / 1048576, 2)
+                stored_source = (
+                    f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(target['title'])}"
+                    if info_hash else target["magnet"]
+                )
                 upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
                 shutil.rmtree(dl_dir, ignore_errors=True)
 
@@ -1228,7 +1282,7 @@ async def check_audio_upgrades():
                     SET stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
                         file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?
                     WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, target["magnet"], new_score, ep["ep_id"]])
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, ep["ep_id"]])
 
                 log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
             except Exception as up_ex:
