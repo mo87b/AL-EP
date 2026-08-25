@@ -5,6 +5,10 @@ on:
   repository_dispatch:
     types: [trigger-sync]
 
+concurrency:
+  group: anime-sync-pipeline
+  cancel-in-progress: false
+
 jobs:
   run-sync-pipeline:
     name: Execute Data Pipeline
