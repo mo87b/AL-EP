@@ -1030,8 +1030,8 @@ async def resolve_pending_episodes():
         now_ts = int(time.time())
         aired_at = ep.get("aired_at") or 0
 
-        # Non-translated anime check: if Ep 1 aired > 5 days ago and was never found, blacklist
-        if ep_num == 1 and aired_at > 0 and (now_ts - aired_at > 5 * 86400):
+        # Non-translated anime check: if Ep 1 aired > 7 days ago and was never found, blacklist
+        if ep_num == 1 and aired_at > 0 and (now_ts - aired_at > 7 * 86400):
             await blacklist_anime(anime_id, anilist_id, romaji, "first_episode_grace_expired")
             continue
 
