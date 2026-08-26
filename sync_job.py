@@ -18,7 +18,22 @@ import httpx
 TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")
-GAS_PROXY_URL = os.environ.get("GAS_PROXY_URL", "")
+
+GAS_PROXIES = []
+for _k in ["GAS_PROXY_URL", "GAS_PROXY_URL_2", "GAS_PROXY_URL_3"]:
+    _v = os.environ.get(_k, "").strip()
+    if _v and _v not in GAS_PROXIES:
+        GAS_PROXIES.append(_v)
+
+_proxy_idx = 0
+def get_ordered_proxies() -> list:
+    global _proxy_idx
+    if not GAS_PROXIES:
+        return []
+    n = len(GAS_PROXIES)
+    start = _proxy_idx % n
+    _proxy_idx += 1
+    return [GAS_PROXIES[(start + i) % n] for i in range(n)]
 
 SYNC_DAYS = int(os.environ.get("SYNC_DAYS", "12"))
 SYNC_SECONDS = SYNC_DAYS * 24 * 60 * 60
@@ -642,92 +657,106 @@ def extract_info_hash(payload: bytes) -> str:
 
 # ─── Nyaa Search & Proxy Integration ──────────────────────────
 async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> tuple:
-    """Returns (results, diagnostic_note). note is empty when results were found."""
+    """Returns (results, diagnostic_note). Tries available GAS proxies with automatic failover."""
     encoded_query = urllib.parse.quote(query)
-    url = f"{GAS_PROXY_URL}?q={encoded_query}"
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     tag = query[:40].replace("\n", " ")
+    
+    proxies = get_ordered_proxies()
+    if not proxies:
+        return [], f"'{tag}' no GAS proxies configured"
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
-            r = await client.get(url)
-            if r.status_code != 200:
-                return [], f"'{tag}' proxy HTTP {r.status_code}"
-
-            raw_items = []
-            text = r.text
-            if text.startswith("{"):
-                try:
-                    data = r.json()
-                except Exception:
-                    return [], f"'{tag}' invalid JSON body"
-                payload = data.get("data")
-                if not isinstance(payload, list):
-                    return [], f"'{tag}' proxy error payload ({data.get('error') or data.get('status')})"
-                for item in payload:
-                    raw_items.append({
-                        "title": item.get("title", ""),
-                        "torrent": item.get("torrent", ""),
-                        "seeders": int(item.get("seeders") or 0),
-                        "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
-                    })
-            elif "<rss" in text or "<item" in text:
-                try:
-                    root = ET.fromstring(r.content)
-                except ET.ParseError:
-                    return [], f"'{tag}' unparsable XML body"
-                items = root.findall(".//item")
-                for item in items:
-                    title_el = item.find("title")
-                    link_el = item.find("link")
-                    pub_el = item.find("pubDate")
-                    title = title_el.text if title_el is not None else ""
-                    torrent_url = link_el.text if link_el is not None else ""
-                    pub_date_ts = 0
-                    if pub_el is not None and pub_el.text:
-                        try:
-                            pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
-                        except Exception:
-                            pub_date_ts = 0
-                    seeders = 0
-                    for child in item:
-                        if child.tag.endswith("seeders"):
-                            seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
-                            break
-                    raw_items.append({
-                        "title": title,
-                        "torrent": torrent_url,
-                        "seeders": seeders,
-                        "pub_date": pub_date_ts
-                    })
-            else:
-                body_head = text.strip()[:50].replace("\n", " ")
-                return [], f"'{tag}' unexpected body: {body_head!r}"
-
-            if not raw_items:
-                return [], f"'{tag}' raw=0"
-
-            results = []
-            for item in raw_items:
-                t = item["title"]
-                torrent_url = item["torrent"]
-                seeders = item["seeders"]
-                pub_date = item.get("pub_date", 0)
-                if not t or not torrent_url:
+    last_err = ""
+    for proxy_base in proxies:
+        url = f"{proxy_base}?q={encoded_query}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
+                r = await client.get(url)
+                if r.status_code != 200:
+                    last_err = f"'{tag}' proxy HTTP {r.status_code}"
                     continue
 
-                if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
-                    results.append({
-                        "title": t,
-                        "magnet": torrent_url,
-                        "seeders": seeders,
-                        "pub_date": pub_date
-                    })
-            if results:
-                return results, ""
-            return [], f"'{tag}' raw={len(raw_items)} matched=0"
-    except Exception as e:
-        return [], f"'{tag}' {type(e).__name__}"
+                raw_items = []
+                text = r.text
+                if text.startswith("{"):
+                    try:
+                        data = r.json()
+                    except Exception:
+                        last_err = f"'{tag}' invalid JSON body"
+                        continue
+                    payload = data.get("data")
+                    if not isinstance(payload, list):
+                        last_err = f"'{tag}' proxy error payload ({data.get('error') or data.get('status')})"
+                        continue
+                    for item in payload:
+                        raw_items.append({
+                            "title": item.get("title", ""),
+                            "torrent": item.get("torrent", ""),
+                            "seeders": int(item.get("seeders") or 0),
+                            "pub_date": int(item.get("pub_date") or item.get("timestamp") or 0)
+                        })
+                elif "<rss" in text or "<item" in text:
+                    try:
+                        root = ET.fromstring(r.content)
+                    except ET.ParseError:
+                        last_err = f"'{tag}' unparsable XML body"
+                        continue
+                    items = root.findall(".//item")
+                    for item in items:
+                        title_el = item.find("title")
+                        link_el = item.find("link")
+                        pub_el = item.find("pubDate")
+                        title = title_el.text if title_el is not None else ""
+                        torrent_url = link_el.text if link_el is not None else ""
+                        pub_date_ts = 0
+                        if pub_el is not None and pub_el.text:
+                            try:
+                                pub_date_ts = int(email.utils.parsedate_to_datetime(pub_el.text).timestamp())
+                            except Exception:
+                                pub_date_ts = 0
+                        seeders = 0
+                        for child in item:
+                            if child.tag.endswith("seeders"):
+                                seeders = int(child.text or 0) if child.text and child.text.isdigit() else 0
+                                break
+                        raw_items.append({
+                            "title": title,
+                            "torrent": torrent_url,
+                            "seeders": seeders,
+                            "pub_date": pub_date_ts
+                        })
+                else:
+                    body_head = text.strip()[:50].replace("\n", " ")
+                    last_err = f"'{tag}' unexpected body: {body_head!r}"
+                    continue
+
+                if not raw_items:
+                    return [], f"'{tag}' raw=0"
+
+                results = []
+                for item in raw_items:
+                    t = item["title"]
+                    torrent_url = item["torrent"]
+                    seeders = item["seeders"]
+                    pub_date = item.get("pub_date", 0)
+                    if not t or not torrent_url:
+                        continue
+
+                    if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
+                        results.append({
+                            "title": t,
+                            "magnet": torrent_url,
+                            "seeders": seeders,
+                            "pub_date": pub_date
+                        })
+                if results:
+                    return results, ""
+                return [], f"'{tag}' raw={len(raw_items)} matched=0"
+        except Exception as e:
+            last_err = f"'{tag}' {type(e).__name__}"
+            continue
+            
+    return [], last_err or f"'{tag}' all proxies failed"
 
 # ─── aria2c Downloader & Pixeldrain Uploader ──────────────────
 def is_valid_torrent_data(data: bytes) -> bool:
@@ -743,31 +772,28 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     download_dir = tempfile.mkdtemp(prefix="anime_")
     torrent_file_path = os.path.join(download_dir, "download.torrent")
     raw_payload = None
+    torrent_input = torrent_source
 
-    # 1. Download .torrent file directly through Google Apps Script Proxy
+    # 1. Download .torrent file through available Google Apps Script Proxies with failover
     if torrent_source.startswith("http"):
-        gas_url = f"{GAS_PROXY_URL}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
-        try:
-            with httpx.Client(timeout=30.0) as client:
-                r = client.get(gas_url)
-                if r.status_code == 200:
-                    data = r.json()
-                    if data.get("status") == 200 and data.get("data"):
-                        import base64
-                        raw_bytes = base64.b64decode(data["data"])
-                        if is_valid_torrent_data(raw_bytes):
-                            with open(torrent_file_path, "wb") as f:
-                                f.write(raw_bytes)
-                            raw_payload = raw_bytes
-                            torrent_input = torrent_file_path
-                        else:
-                            torrent_input = torrent_source
-                    else:
-                        torrent_input = torrent_source
-                else:
-                    torrent_input = torrent_source
-        except Exception:
-            torrent_input = torrent_source
+        for proxy_base in get_ordered_proxies():
+            gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
+            try:
+                with httpx.Client(timeout=30.0) as client:
+                    r = client.get(gas_url)
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("status") == 200 and data.get("data"):
+                            import base64
+                            raw_bytes = base64.b64decode(data["data"])
+                            if is_valid_torrent_data(raw_bytes):
+                                with open(torrent_file_path, "wb") as f:
+                                    f.write(raw_bytes)
+                                raw_payload = raw_bytes
+                                torrent_input = torrent_file_path
+                                break
+            except Exception:
+                continue
     else:
         torrent_input = torrent_source
 

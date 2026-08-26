@@ -41,5 +41,7 @@ jobs:
           TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}
           PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
           GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL }}
+          GAS_PROXY_URL_2: ${{ secrets.GAS_PROXY_URL_2 }}
+          GAS_PROXY_URL_3: ${{ secrets.GAS_PROXY_URL_3 }}
         run: |
           python sync_job.py
