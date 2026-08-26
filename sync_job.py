@@ -667,10 +667,11 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
         return [], f"'{tag}' no GAS proxies configured"
 
     last_err = ""
+    transport = httpx.AsyncHTTPTransport(retries=2)
     for proxy_base in proxies:
         url = f"{proxy_base}?q={encoded_query}"
         try:
-            async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as client:
+            async with httpx.AsyncClient(transport=transport, timeout=20.0, headers=headers, follow_redirects=True) as client:
                 r = await client.get(url)
                 if r.status_code != 200:
                     last_err = f"'{tag}' proxy HTTP {r.status_code}"
@@ -776,10 +777,11 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
 
     # 1. Download .torrent file through available Google Apps Script Proxies with failover
     if torrent_source.startswith("http"):
+        sync_transport = httpx.HTTPTransport(retries=2)
         for proxy_base in get_ordered_proxies():
             gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(torrent_source)}"
             try:
-                with httpx.Client(timeout=30.0) as client:
+                with httpx.Client(transport=sync_transport, timeout=30.0) as client:
                     r = client.get(gas_url)
                     if r.status_code == 200:
                         data = r.json()
