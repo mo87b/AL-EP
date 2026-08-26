@@ -1076,9 +1076,18 @@ async def resolve_pending_episodes():
         now_ts = int(time.time())
         aired_at = ep.get("aired_at") or 0
 
-        # Non-translated anime check: if Ep 1 aired > 7 days ago and was never found, blacklist
+        # Non-translated anime check: if Ep 1 aired > 7 days ago and was never found, blacklist.
+        # Skip if the anime already has available episodes (e.g. ep2+ got subbed) so we never
+        # wipe a working catalogue just because episode 1 lagged behind.
         if ep_num == 1 and aired_at > 0 and (now_ts - aired_at > 7 * 86400):
-            await blacklist_anime(anime_id, anilist_id, romaji, "first_episode_grace_expired")
+            existing = await execute_sql(
+                "SELECT 1 FROM episodes WHERE anime_id = ? AND status = 'ready' LIMIT 1",
+                [anime_id],
+            )
+            if existing:
+                log_message(f"Ep1 grace expired but anime has available episodes; skipping blacklist: {romaji}")
+            else:
+                await blacklist_anime(anime_id, anilist_id, romaji, "first_episode_grace_expired")
             continue
 
         log_message(f"Searching torrents for: {romaji} (Ep {ep_num})")
