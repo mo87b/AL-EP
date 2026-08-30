@@ -140,7 +140,8 @@ async def ensure_database_schema():
         )
     """)
     for col in ["is_multi_audio INTEGER DEFAULT 0", "audio_score INTEGER DEFAULT 0", "erai_title TEXT", 
-                "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT"]:
+                "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT",
+                "pending_review_until INTEGER DEFAULT 0"]:
         try:
             col_name = col.split()[0]
             await execute_sql(f"ALTER TABLE episodes ADD COLUMN {col}")
@@ -1192,15 +1193,110 @@ async def resolve_pending_episodes():
             await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
             continue
 
-        # Smart Sort: Multi-Audio > Trusted Groups > Platform Score > Quality > Source > Seeders
-        good.sort(key=lambda x: (
-            get_audio_score(x["title"]),
-            1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
-            get_platform_score(x["title"]),
-            get_quality_weight(x["title"]),
-            get_source_weight(x["title"]),
-            x["seeders"]
-        ), reverse=True)
+        # ── Arabic Subtitle Priority ───────────────────────────────
+        # If multiple multi-subs from different platforms, check detail pages for Arabic
+        def _has_arabic_variants(text: str) -> bool:
+            if not text: return False
+            t = text.lower()
+            # All Arabic variants: ara, ar, arabic, العربية, عربي
+            return bool(re.search(r'\barabic\b|\bara\b|(?<!\w)ar(?!\w)|العربية|عربي', t))
+
+        # Identify multi-subs candidates from different platforms
+        multi_subs_candidates = [r for r in good if bool(re.search(r'\b(multi|m)\s*[-_:]?\s*subs?\b|multisubs?', r["title"].lower()))]
+        platforms_in_multi = set()
+        for r in multi_subs_candidates:
+            # Extract platform hint from title (cr, nf, etc.)
+            if re.search(r'\b(cr|crunchyroll)\b', r["title"].lower()):
+                platforms_in_multi.add('cr')
+            elif re.search(r'\b(nf|netflix)\b', r["title"].lower()):
+                platforms_in_multi.add('nf')
+            elif re.search(r'\b(amzn|amazon)\b', r["title"].lower()):
+                platforms_in_multi.add('amzn')
+            elif re.search(r'\b(bilibili|bili)\b', r["title"].lower()):
+                platforms_in_multi.add('bili')
+            else:
+                platforms_in_multi.add('other')
+
+        # Only do extra fetch if at least 2 different platforms with multi-subs
+        arabic_cache = {}
+        if len(multi_subs_candidates) >= 2 and len(platforms_in_multi) >= 2:
+            async def _check_arabic_for_item(item):
+                magnet = item.get("magnet", "")
+                # Derive view URL from download URL: /download/ -> /view/
+                view_url = None
+                if "nyaa.si/download/" in magnet:
+                    view_url = magnet.replace("/download/", "/view/").split(".torrent")[0]
+                elif "nyaa.si/view/" in magnet:
+                    view_url = magnet
+                else:
+                    # Try to use magnet as is (may be view page via proxy)
+                    view_url = magnet
+                # Try GAS proxy for detail page or direct fetch
+                for proxy_base in get_ordered_proxies():
+                    try:
+                        # Nyaa view page is HTML, not JSON - try direct via proxy with view url
+                        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                            # Use proxy to fetch view page HTML via ?url= param if proxy supports it, else try direct
+                            # For now, try to fetch via proxy's torrent mode with view url
+                            gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
+                            # Alternative: try to fetch HTML directly via proxy's q param if it's a search proxy
+                            # Fallback to direct fetch of view_url
+                            r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0"})
+                            if r.status_code == 200 and "Subtitles Info" in r.text:
+                                return _has_arabic_variants(r.text)
+                            # Try via GAS proxy as search
+                            r2 = await client.get(gas_url)
+                            if r2.status_code == 200:
+                                try:
+                                    data = r2.json()
+                                    if data.get("data"):
+                                        import base64
+                                        html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
+                                        return _has_arabic_variants(html)
+                                except: pass
+                                return _has_arabic_variants(r2.text)
+                    except: continue
+                # If all fails, check title itself for Arabic hint (fallback)
+                return _has_arabic_variants(item.get("title",""))
+
+            # Run checks concurrently for all multi-subs candidates
+            check_tasks = [ _check_arabic_for_item(r) for r in good ]
+            try:
+                results = await asyncio.gather(*check_tasks, return_exceptions=True)
+                for idx, res in enumerate(results):
+                    if isinstance(res, Exception):
+                        arabic_cache[good[idx]["magnet"]] = False
+                    else:
+                        arabic_cache[good[idx]["magnet"]] = bool(res)
+                        if res:
+                            log_message(f"Arabic subtitle found in: {good[idx]['title'][:60]}")
+            except Exception as e:
+                log_message(f"Arabic check failed: {e}")
+
+        # Smart Sort: Arabic (if checked) > Multi-Audio > Trusted Groups > Platform Score > Quality > Source > Seeders
+        def _arabic_score(item):
+            return 1 if arabic_cache.get(item["magnet"], False) else 0
+
+        # Only apply Arabic priority if we actually checked (cache not empty)
+        if arabic_cache:
+            good.sort(key=lambda x: (
+                _arabic_score(x),
+                get_audio_score(x["title"]),
+                1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
+                get_platform_score(x["title"]),
+                get_quality_weight(x["title"]),
+                get_source_weight(x["title"]),
+                x["seeders"]
+            ), reverse=True)
+        else:
+            good.sort(key=lambda x: (
+                get_audio_score(x["title"]),
+                1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
+                get_platform_score(x["title"]),
+                get_quality_weight(x["title"]),
+                get_source_weight(x["title"]),
+                x["seeders"]
+            ), reverse=True)
 
         winner = good[0]
         torrent_title = winner["title"]
@@ -1224,21 +1320,44 @@ async def resolve_pending_episodes():
             pd_url = upload["url"]
 
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            await execute_sql("""
-                UPDATE episodes 
-                SET status = 'ready',
-                    stream_url = ?,
-                    pixeldrain_id = ?,
-                    pixeldrain_1080_url = ?,
-                    pixeldrain_1080_id = ?,
-                    file_size_mb = ?,
-                    magnet_link = ?,
-                    is_multi_audio = ?,
-                    audio_score = ?,
-                    uploaded_at = ?,
-                    last_checked = ?
-                WHERE id = ?
-            """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
+            # Grace period: if not CR, keep as ready but still check for CR with Arabic for 1 hour (user sees episode immediately)
+            is_cr = get_platform_score(torrent_title) >= 3
+            if not is_cr:
+                pending_until = int(time.time()) + 3600
+                await execute_sql("""
+                    UPDATE episodes 
+                    SET status = 'ready',
+                        stream_url = ?,
+                        pixeldrain_id = ?,
+                        pixeldrain_1080_url = ?,
+                        pixeldrain_1080_id = ?,
+                        file_size_mb = ?,
+                        magnet_link = ?,
+                        is_multi_audio = ?,
+                        audio_score = ?,
+                        uploaded_at = ?,
+                        last_checked = ?,
+                        pending_review_until = ?
+                    WHERE id = ?
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, now_str, int(time.time()), pending_until, ep_id])
+                log_message(f"Non-CR torrent for {romaji} Ep {ep_num} - visible as ready, grace period 1h until {pending_until} to wait for CR with Arabic")
+            else:
+                await execute_sql("""
+                    UPDATE episodes 
+                    SET status = 'ready',
+                        stream_url = ?,
+                        pixeldrain_id = ?,
+                        pixeldrain_1080_url = ?,
+                        pixeldrain_1080_id = ?,
+                        file_size_mb = ?,
+                        magnet_link = ?,
+                        is_multi_audio = ?,
+                        audio_score = ?,
+                        uploaded_at = ?,
+                        last_checked = ?,
+                        pending_review_until = 0
+                    WHERE id = ?
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
 
             # Timer reset: refresh aired_at for sibling pending episodes of this anime
             await execute_sql("UPDATE episodes SET aired_at = ? WHERE anime_id = ? AND status = 'pending'", [now_ts, anime_id])
@@ -1254,6 +1373,81 @@ async def resolve_pending_episodes():
         except Exception as ex:
             log_message(f"Failed to process {romaji} Ep {ep_num}: {ex}")
             await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
+
+# ─── Pending Review Grace Period (Non-CR -> wait for CR with Arabic) ──
+async def check_pending_reviews():
+    log_message("Checking pending reviews (non-CR grace period)...")
+    pending = await execute_sql("""
+        SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.pixeldrain_1080_url,
+               e.pending_review_until, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
+        FROM episodes e
+        JOIN anime a ON e.anime_id = a.id
+        WHERE e.status = 'ready' AND e.pending_review_until > 0
+        ORDER BY e.pending_review_until ASC
+        LIMIT 10
+    """)
+    if not pending:
+        return
+    now = int(time.time())
+    for ep in pending:
+        ep_id = ep["ep_id"]
+        until = ep.get("pending_review_until") or 0
+        romaji = ep["title_romaji"]
+        english = ep["title_english"]
+        ep_num = ep["episode_number"]
+        # If grace period expired, clear pending flag (keep as ready)
+        if now >= until:
+            await execute_sql("UPDATE episodes SET pending_review_until = 0 WHERE id = ?", [ep_id])
+            log_message(f"Grace expired for {romaji} Ep {ep_num} -> keep ready, no CR found")
+            continue
+        # Still within grace period, search for CR with Arabic
+        synonyms = json.loads(ep["synonyms"]) if ep["synonyms"] else []
+        erai_title = ep.get("erai_title")
+        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=ep["format"] in ["SPECIAL","MOVIE","OVA","ONA"], erai_title=erai_title)
+        found_better = None
+        for i in range(0, min(len(queries), 4), 2):
+            batch = queries[i:i+2]
+            tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms) for q in batch]
+            batch_res = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in batch_res:
+                if isinstance(res, Exception):
+                    continue
+                res_list, _ = res
+                for r in res_list:
+                    # Only consider CR
+                    if get_platform_score(r["title"]) < 3:
+                        continue
+                    if not bool(re.search(r'\b(multi|m)\s*[-_:]?\s*subs?\b|multisubs?', r["title"].lower())):
+                        continue
+                    # Check for Arabic in detail page (reuse cache from earlier Arabic check)
+                    # For pending review, we do a quick title check for Arabic as proxy
+                    if re.search(r'\barabic\b|\bara\b|العربية|عربي', r["title"].lower()):
+                        found_better = r
+                        break
+                if found_better:
+                    break
+            if found_better:
+                break
+        if found_better:
+            log_message(f"Grace: CR with Arabic found for {romaji} Ep {ep_num}: {found_better['title']}")
+            try:
+                dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, found_better["magnet"], found_better["title"])
+                size_mb = round(v_size / 1048576, 2)
+                stored_source = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(found_better['title'])}" if info_hash else found_better["magnet"]
+                upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
+                shutil.rmtree(dl_dir, ignore_errors=True)
+                if ep["pixeldrain_id"]:
+                    delete_from_pixeldrain(ep["pixeldrain_id"])
+                pd_id = upload["id"]
+                pd_url = upload["url"]
+                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                await execute_sql("""
+                    UPDATE episodes SET status = 'ready', stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
+                        file_size_mb = ?, magnet_link = ?, uploaded_at = ?, pending_review_until = 0 WHERE id = ?
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, now_str, ep_id])
+                log_message(f"Grace: replaced {romaji} Ep {ep_num} with CR Arabic version")
+            except Exception as e:
+                log_message(f"Grace: failed to replace {romaji} Ep {ep_num}: {e}")
 
 # ─── Audio Upgrade Monitor ─────────────────────────────────────
 async def check_audio_upgrades():
@@ -1334,6 +1528,7 @@ async def main():
     await sync_anilist_schedule()
     await check_finished_anime_catchup()
     await resolve_pending_episodes()
+    await check_pending_reviews()
     await check_audio_upgrades()
     elapsed = round(time.time() - t0, 1)
     log_message(f"=== Job Finished in {elapsed}s ===")
