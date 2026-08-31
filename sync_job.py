@@ -558,6 +558,34 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
     if e_super and e_super not in search_bases:
         search_bases.append(e_super)
         
+    # Japanese suffix / hyphen variations (e.g. Tenkousaki -> Tenkou-saki / Tenkou saki)
+    COMMON_SUFFIXES = ["saki", "tabi", "gumi", "jima", "bashi", "mura", "kan", "sou", "ken", "chou"]
+    for title_base in [r_base] + synonyms:
+        if not title_base:
+            continue
+        c_words = clean_and_strip(title_base).split()
+        for i, w in enumerate(c_words[:3]):
+            w_lower = w.lower()
+            if "-" in w:
+                unhyphen = w.replace("-", "")
+                spaced = w.replace("-", " ")
+                v1 = " ".join(c_words[:i] + [unhyphen] + c_words[i+1:])
+                v2 = " ".join(c_words[:i] + [spaced] + c_words[i+1:])
+                for var in (v1, v2):
+                    if var and var not in search_bases:
+                        search_bases.append(var)
+            else:
+                for sfx in COMMON_SUFFIXES:
+                    if w_lower.endswith(sfx) and len(w_lower) > len(sfx) + 2:
+                        pfx = w[:-len(sfx)]
+                        hyphen_var = f"{pfx}-{sfx}"
+                        space_var = f"{pfx} {sfx}"
+                        v1 = " ".join(c_words[:i] + [hyphen_var] + c_words[i+1:])
+                        v2 = " ".join(c_words[:i] + [space_var] + c_words[i+1:])
+                        for var in (v1, v2):
+                            if var and var not in search_bases:
+                                search_bases.append(var)
+        
     for syn in synonyms:
         cleaned_syn = clean_and_strip(syn)
         if cleaned_syn and cleaned_syn not in search_bases:
