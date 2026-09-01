@@ -1440,11 +1440,12 @@ async def check_pending_reviews():
         # Still within grace period, search for CR with Arabic
         synonyms = json.loads(ep["synonyms"]) if ep["synonyms"] else []
         erai_title = ep.get("erai_title")
-        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=ep["format"] in ["SPECIAL","MOVIE","OVA","ONA"], erai_title=erai_title)
+        is_special = ep.get("format") in ["SPECIAL", "MOVIE", "OVA", "ONA"]
+        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special, erai_title=erai_title)
         found_better = None
         for i in range(0, min(len(queries), 4), 2):
             batch = queries[i:i+2]
-            tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms) for q in batch]
+            tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special) for q in batch]
             batch_res = await asyncio.gather(*tasks, return_exceptions=True)
             for res in batch_res:
                 if isinstance(res, Exception):
