@@ -372,6 +372,10 @@ def get_clean_words(title: str) -> list:
     clean_t = title_no_num.replace('.', ' ').replace('-', ' ').replace("'", "")
     clean_t = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_t)
     words = clean_t.split()
+    if not words:
+        clean_with_num = title_no_se.replace('.', ' ').replace('-', ' ').replace("'", "")
+        clean_with_num = re.sub(r'[^a-zA-Z0-9\s]', ' ', clean_with_num)
+        words = clean_with_num.split()
     
     particles = {
         "no", "to", "in", "of", "a", "an", "the", "is", "at", "by", "on", 
@@ -717,7 +721,7 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
                     continue
 
                 raw_items = []
-                text = r.text
+                text = r.text.strip()
                 if text.startswith("{"):
                     try:
                         data = r.json()
@@ -905,6 +909,18 @@ async def cleanup_pixeldrain_duplicates():
     if not PIXELDRAIN_API_KEY:
         return
     try:
+        # Protect active IDs currently used in the database
+        db_rows = await execute_sql("""
+            SELECT pixeldrain_id, pixeldrain_1080_id, backup_720_id, backup_480_id 
+            FROM episodes 
+            WHERE status = 'ready'
+        """)
+        active_ids = set()
+        for r in db_rows:
+            for k in ["pixeldrain_id", "pixeldrain_1080_id", "backup_720_id", "backup_480_id"]:
+                if r.get(k):
+                    active_ids.add(r[k])
+
         url = "https://pixeldrain.com/api/user/files"
         async with httpx.AsyncClient(timeout=30.0) as client:
             r = await client.get(url, auth=("", PIXELDRAIN_API_KEY))
@@ -921,10 +937,14 @@ async def cleanup_pixeldrain_duplicates():
                 saved_bytes = 0
                 for name, flist in by_name.items():
                     if len(flist) > 1:
-                        flist.sort(key=lambda x: x.get("date_upload", ""), reverse=True)
-                        for dup in flist[1:]:
-                            to_delete.append(dup["id"])
-                            saved_bytes += dup.get("size", 0)
+                        keep_ids = {f["id"] for f in flist if f["id"] in active_ids}
+                        if not keep_ids:
+                            flist.sort(key=lambda x: x.get("date_upload", ""), reverse=True)
+                            keep_ids = {flist[0]["id"]}
+                        for dup in flist:
+                            if dup["id"] not in keep_ids:
+                                to_delete.append(dup["id"])
+                                saved_bytes += dup.get("size", 0)
                 
                 if to_delete:
                     for fid in to_delete:
