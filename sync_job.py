@@ -148,17 +148,21 @@ async def ensure_database_schema():
             blacklisted_at INTEGER
         )
     """)
-    for col in ["is_multi_audio INTEGER DEFAULT 0", "audio_score INTEGER DEFAULT 0", "erai_title TEXT", 
-                "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT",
-                "pending_review_until INTEGER DEFAULT 0", "subtitles TEXT", "audio_tracks TEXT",
-                "subtitles_1080 TEXT", "audio_tracks_1080 TEXT",
-                "subtitles_720 TEXT", "audio_tracks_720 TEXT",
-                "subtitles_480 TEXT", "audio_tracks_480 TEXT"]:
-        try:
-            col_name = col.split()[0]
+    existing_cols = await execute_sql("PRAGMA table_info(episodes)")
+    existing = {row.get("name") for row in existing_cols or [] if isinstance(row, dict)}
+    
+    columns_to_add = [
+        "is_multi_audio INTEGER DEFAULT 0", "audio_score INTEGER DEFAULT 0", "erai_title TEXT", 
+        "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT",
+        "pending_review_until INTEGER DEFAULT 0", "subtitles TEXT", "audio_tracks TEXT",
+        "subtitles_1080 TEXT", "audio_tracks_1080 TEXT",
+        "subtitles_720 TEXT", "audio_tracks_720 TEXT",
+        "subtitles_480 TEXT", "audio_tracks_480 TEXT"
+    ]
+    for col in columns_to_add:
+        col_name = col.split()[0]
+        if col_name not in existing:
             await execute_sql(f"ALTER TABLE episodes ADD COLUMN {col}")
-        except Exception:
-            pass
 
     # Self-healing: Reset any stuck processing episodes from crashed runs
     try:
