@@ -98,14 +98,23 @@ async def execute_sql(sql: str, args: list = None) -> list:
         ]
     }
     headers = {"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient(timeout=25.0) as client:
-        r = await client.post(f"{TURSO_URL}/v2/pipeline", headers=headers, json=body)
-        if r.status_code != 200:
-            log_message(f"DB error ({r.status_code})")
-            return []
-        res = r.json()
-        exec_result = res["results"][0]["response"]["result"]
-        return _parse_turso_result(exec_result)
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            r = await client.post(f"{TURSO_URL}/v2/pipeline", headers=headers, json=body)
+            if r.status_code != 200:
+                log_message(f"DB error ({r.status_code})")
+                return []
+            res = r.json()
+            first_res = res.get("results", [{}])[0]
+            if first_res.get("type") == "error":
+                err_msg = first_res.get("error", {}).get("message", "Unknown DB error")
+                log_message(f"DB execute error: {err_msg}")
+                return []
+            exec_result = first_res.get("response", {}).get("result", {})
+            return _parse_turso_result(exec_result)
+    except Exception as e:
+        log_message(f"DB exception: {e}")
+        return []
 
 async def execute_sql_batch(statements: list) -> list:
     if not statements:
@@ -974,6 +983,7 @@ async def sync_anilist_schedule():
                 if not schedules:
                     break
 
+                valid_schedules = []
                 batch_stmts = []
                 for item in schedules:
                     m = item["media"]
@@ -990,6 +1000,7 @@ async def sync_anilist_schedule():
                     if any(str(g).lower() in {"hentai", "ecchi"} for g in genres_list):
                         continue
 
+                    valid_schedules.append(item)
                     romaji = m["title"]["romaji"] or ""
                     english = m["title"]["english"] or ""
                     native = m["title"]["native"] or ""
@@ -1015,11 +1026,9 @@ async def sync_anilist_schedule():
                     await execute_sql_batch(batch_stmts)
 
                 ep_batch = []
-                for item in schedules:
+                for item in valid_schedules:
                     m = item["media"]
                     anilist_id = m["id"]
-                    if anilist_id in blacklisted:
-                        continue
                     ep_num = item["episode"]
                     airing_ts = item["airingAt"]
                     ep_batch.append(("""
@@ -1030,7 +1039,7 @@ async def sync_anilist_schedule():
 
                 if ep_batch:
                     await execute_sql_batch(ep_batch)
-                log_message(f"Page {page}: synced {len(schedules)} entries.")
+                log_message(f"Page {page}: synced {len(valid_schedules)} entries.")
 
                 has_next = data.get("pageInfo", {}).get("hasNextPage", False)
                 page += 1
@@ -1387,9 +1396,6 @@ async def resolve_pending_episodes():
                         pending_review_until = 0
                     WHERE id = ?
                 """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
-
-            # Timer reset: refresh aired_at for sibling pending episodes of this anime
-            await execute_sql("UPDATE episodes SET aired_at = ? WHERE anime_id = ? AND status = 'pending'", [now_ts, anime_id])
 
             # Store parsed erai_title for future searches
             parsed_erai = parse_erai_anime_title(v_name)
