@@ -268,13 +268,14 @@ def get_season_number(title: str) -> int:
     if m:
         return int(m.group(1))
 
-    if re.search(r'\bii\b$', title_lower) or re.search(r'\bii\b(?=\s)', title_lower):
+    clean_no_ver = re.sub(r'\bv\d+\b', '', title_lower)
+    if re.search(r'\bii\b$', clean_no_ver) or re.search(r'\bii\b(?=\s)', clean_no_ver):
         return 2
-    if re.search(r'\biii\b$', title_lower) or re.search(r'\biii\b(?=\s)', title_lower):
+    if re.search(r'\biii\b$', clean_no_ver) or re.search(r'\biii\b(?=\s)', clean_no_ver):
         return 3
-    if re.search(r'\biv\b$', title_lower) or re.search(r'\biv\b(?=\s)', title_lower):
+    if re.search(r'\biv\b$', clean_no_ver) or re.search(r'\biv\b(?=\s)', clean_no_ver):
         return 4
-    if re.search(r'\bv\b$', title_lower) or re.search(r'\bv\b(?=\s)', title_lower):
+    if (re.search(r'\bv\b$', clean_no_ver) or re.search(r'\bv\b(?=\s)', clean_no_ver)) and not re.search(r'\b(1080p|720p|480p|2160p|mkv|mp4|v)\s+v\b', title_lower):
         return 5
  
     clean_end = re.sub(r'[^a-z0-9\s]', '', title_lower).strip()
@@ -373,7 +374,7 @@ def get_clean_words(title: str) -> list:
         w_stripped = w.strip("-'")
         if not w_stripped or w_stripped in SEASON_STOPWORDS or w_stripped in particles:
             continue
-        if len(w_stripped) >= 2 or len(words) == 1:
+        if len(w_stripped) >= 2 or (len(w_stripped) == 1 and w_stripped.isalnum()):
             filtered.append(w_stripped)
     return filtered
 
@@ -911,7 +912,7 @@ async def cleanup_pixeldrain_duplicates():
                 saved_bytes = 0
                 for name, flist in by_name.items():
                     if len(flist) > 1:
-                        flist.sort(key=lambda x: x.get("date_upload", ""))
+                        flist.sort(key=lambda x: x.get("date_upload", ""), reverse=True)
                         for dup in flist[1:]:
                             to_delete.append(dup["id"])
                             saved_bytes += dup.get("size", 0)
@@ -1101,8 +1102,8 @@ async def resolve_pending_episodes():
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'pending'
           AND e.aired_at >= ?
-          AND e.episode_number = (
-              SELECT MIN(e2.episode_number) FROM episodes e2
+          AND CAST(e.episode_number AS INTEGER) = (
+              SELECT MIN(CAST(e2.episode_number AS INTEGER)) FROM episodes e2
               WHERE e2.anime_id = e.anime_id AND e2.status = 'pending' AND e2.aired_at >= ?
           )
         ORDER BY e.aired_at DESC, e.last_checked ASC
@@ -1498,11 +1499,12 @@ async def check_audio_upgrades():
         ep_num = ep["episode_number"]
         synonyms = json.loads(ep["synonyms"]) if ep["synonyms"] else []
 
-        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, erai_title=erai_title)
+        is_special = ep.get("format") in ["SPECIAL", "MOVIE", "OVA", "ONA"]
+        queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special, erai_title=erai_title)
         better = []
         for i in range(0, min(len(queries), 4), 2):
             batch = queries[i:i+2]
-            tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms) for q in batch]
+            tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special) for q in batch]
             batch_res = await asyncio.gather(*tasks, return_exceptions=True)
             for res in batch_res:
                 if isinstance(res, Exception):
