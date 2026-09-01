@@ -150,7 +150,10 @@ async def ensure_database_schema():
     """)
     for col in ["is_multi_audio INTEGER DEFAULT 0", "audio_score INTEGER DEFAULT 0", "erai_title TEXT", 
                 "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT",
-                "pending_review_until INTEGER DEFAULT 0", "subtitles TEXT", "audio_tracks TEXT"]:
+                "pending_review_until INTEGER DEFAULT 0", "subtitles TEXT", "audio_tracks TEXT",
+                "subtitles_1080 TEXT", "audio_tracks_1080 TEXT",
+                "subtitles_720 TEXT", "audio_tracks_720 TEXT",
+                "subtitles_480 TEXT", "audio_tracks_480 TEXT"]:
         try:
             col_name = col.split()[0]
             await execute_sql(f"ALTER TABLE episodes ADD COLUMN {col}")
@@ -1468,11 +1471,13 @@ async def resolve_pending_episodes():
                         audio_score = ?,
                         subtitles = ?,
                         audio_tracks = ?,
+                        subtitles_1080 = ?,
+                        audio_tracks_1080 = ?,
                         uploaded_at = ?,
                         last_checked = ?,
                         pending_review_until = ?
                     WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, now_str, int(time.time()), pending_until, ep_id])
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()), pending_until, ep_id])
                 log_message(f"Non-CR torrent for {romaji} Ep {ep_num} - visible as ready, grace period 1h until {pending_until} to wait for CR with Arabic")
             else:
                 await execute_sql("""
@@ -1488,11 +1493,13 @@ async def resolve_pending_episodes():
                         audio_score = ?,
                         subtitles = ?,
                         audio_tracks = ?,
+                        subtitles_1080 = ?,
+                        audio_tracks_1080 = ?,
                         uploaded_at = ?,
                         last_checked = ?,
                         pending_review_until = 0
                     WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, now_str, int(time.time()), ep_id])
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, now_str, int(time.time()), ep_id])
 
             # Store parsed erai_title for future searches
             parsed_erai = parse_erai_anime_title(v_name)
@@ -1580,9 +1587,11 @@ async def check_pending_reviews():
                 pd_url = upload["url"]
                 now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 await execute_sql("""
-                    UPDATE episodes SET status = 'ready', stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
-                        file_size_mb = ?, magnet_link = ?, subtitles = ?, audio_tracks = ?, uploaded_at = ?, pending_review_until = 0 WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, subs_found, audio_found, now_str, ep_id])
+                    UPDATE episodes 
+                    SET status = 'ready', stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
+                        file_size_mb = ?, magnet_link = ?, subtitles = ?, audio_tracks = ?, subtitles_1080 = ?, audio_tracks_1080 = ?, uploaded_at = ?, pending_review_until = 0 
+                    WHERE id = ?
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, subs_found, audio_found, subs_found, audio_found, now_str, ep_id])
                 log_message(f"Grace: replaced {romaji} Ep {ep_num} with CR Arabic version (Subs: {subs_found})")
             except Exception as e:
                 log_message(f"Grace: failed to replace {romaji} Ep {ep_num}: {e}")
@@ -1655,9 +1664,9 @@ async def check_audio_upgrades():
                 await execute_sql("""
                     UPDATE episodes
                     SET stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
-                        file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?, subtitles = ?, audio_tracks = ?
+                        file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?, subtitles = ?, audio_tracks = ?, subtitles_1080 = ?, audio_tracks_1080 = ?
                     WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, subs_found, audio_found, ep["ep_id"]])
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, subs_found, audio_found, subs_found, audio_found, ep["ep_id"]])
 
                 log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
             except Exception as up_ex:
