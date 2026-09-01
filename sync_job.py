@@ -150,7 +150,7 @@ async def ensure_database_schema():
     """)
     for col in ["is_multi_audio INTEGER DEFAULT 0", "audio_score INTEGER DEFAULT 0", "erai_title TEXT", 
                 "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT",
-                "pending_review_until INTEGER DEFAULT 0"]:
+                "pending_review_until INTEGER DEFAULT 0", "subtitles TEXT", "audio_tracks TEXT"]:
         try:
             col_name = col.split()[0]
             await execute_sql(f"ALTER TABLE episodes ADD COLUMN {col}")
@@ -881,6 +881,94 @@ def download_torrent(torrent_source: str, torrent_title: str) -> tuple:
     info_hash = extract_info_hash(raw_payload) if raw_payload else None
     return download_dir, best_file[0], best_file[1], best_file[2], info_hash
 
+def inspect_media_tracks(video_path: str) -> tuple:
+    """Uses ffprobe to extract subtitle and audio tracks, keeping only allowed languages."""
+    ALLOWED_SUBS = {"Arabic", "English", "French", "Japanese"}
+    ALLOWED_AUDIO = {"Japanese", "Arabic", "English", "French", "Chinese", "Korean"}
+
+    LANG_MAP = {
+        "ara": "Arabic", "ar": "Arabic", "arabic": "Arabic", "العربية": "Arabic", "عربي": "Arabic",
+        "eng": "English", "en": "English", "english": "English",
+        "fra": "French", "fre": "French", "fr": "French", "french": "French", "français": "French",
+        "jpn": "Japanese", "ja": "Japanese", "japanese": "Japanese", "jp": "Japanese", "日本語": "Japanese",
+        "chi": "Chinese", "zho": "Chinese", "zh": "Chinese", "chinese": "Chinese",
+        "kor": "Korean", "ko": "Korean", "korean": "Korean",
+    }
+
+    def _resolve_lang(lang_tag: str, title_tag: str) -> str:
+        tag_str = (lang_tag or "").strip().lower()
+        title_str = (title_tag or "").strip().lower()
+
+        if tag_str in LANG_MAP:
+            return LANG_MAP[tag_str]
+        
+        for key, name in LANG_MAP.items():
+            if re.search(rf'\b{re.escape(key)}\b', title_str):
+                return name
+            if name.lower() in title_str:
+                return name
+        return None
+
+    found_subs = set()
+    found_audio = set()
+
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_streams",
+            "-show_entries", "stream=codec_type:stream_tags=language,title",
+            video_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if res.returncode == 0 and res.stdout:
+            data = json.loads(res.stdout)
+            streams = data.get("streams", [])
+            for s in streams:
+                c_type = s.get("codec_type")
+                tags = s.get("tags") or {}
+                lang_tag = tags.get("language")
+                title_tag = tags.get("title")
+
+                resolved = _resolve_lang(lang_tag, title_tag)
+                if c_type == "subtitle":
+                    if resolved and resolved in ALLOWED_SUBS:
+                        found_subs.add(resolved)
+                elif c_type == "audio":
+                    if resolved and resolved in ALLOWED_AUDIO:
+                        found_audio.add(resolved)
+                    elif not resolved and not found_audio:
+                        found_audio.add("Japanese")
+    except Exception as e:
+        log_message(f"Media probe warning: {e}")
+
+    if not found_audio:
+        found_audio.add("Japanese")
+
+    ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
+    sorted_subs = sorted(found_subs, key=lambda x: ORDER.index(x) if x in ORDER else 99)
+    sorted_audio = sorted(found_audio, key=lambda x: ORDER.index(x) if x in ORDER else 99)
+
+    return ", ".join(sorted_subs), ", ".join(sorted_audio)
+
+def merge_track_lists(existing_tracks: str, new_tracks: str) -> str:
+    """Merges two comma-separated lists of tracks without duplicates."""
+    items = set()
+    if existing_tracks:
+        for t in str(existing_tracks).split(","):
+            t_clean = t.strip()
+            if t_clean:
+                items.add(t_clean)
+    if new_tracks:
+        for t in str(new_tracks).split(","):
+            t_clean = t.strip()
+            if t_clean:
+                items.add(t_clean)
+    ORDER = ["Arabic", "English", "French", "Japanese", "Chinese", "Korean"]
+    sorted_items = sorted(items, key=lambda x: ORDER.index(x) if x in ORDER else 99)
+    return ", ".join(sorted_items)
+
 def upload_pixeldrain(file_path: str, filename: str) -> dict:
     url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(filename)}"
     auth = ("", PIXELDRAIN_API_KEY) if PIXELDRAIN_API_KEY else None
@@ -1372,6 +1460,9 @@ async def resolve_pending_episodes():
                 if info_hash else winner["magnet"]
             )
 
+            subs_found, audio_found = inspect_media_tracks(v_path)
+            log_message(f"Tracks for {romaji} Ep {ep_num}: Subs=[{subs_found}] Audio=[{audio_found}]")
+
             upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
             pd_id = upload["id"]
             pd_url = upload["url"]
@@ -1392,11 +1483,13 @@ async def resolve_pending_episodes():
                         magnet_link = ?,
                         is_multi_audio = ?,
                         audio_score = ?,
+                        subtitles = ?,
+                        audio_tracks = ?,
                         uploaded_at = ?,
                         last_checked = ?,
                         pending_review_until = ?
                     WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, now_str, int(time.time()), pending_until, ep_id])
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, now_str, int(time.time()), pending_until, ep_id])
                 log_message(f"Non-CR torrent for {romaji} Ep {ep_num} - visible as ready, grace period 1h until {pending_until} to wait for CR with Arabic")
             else:
                 await execute_sql("""
@@ -1410,11 +1503,13 @@ async def resolve_pending_episodes():
                         magnet_link = ?,
                         is_multi_audio = ?,
                         audio_score = ?,
+                        subtitles = ?,
+                        audio_tracks = ?,
                         uploaded_at = ?,
                         last_checked = ?,
                         pending_review_until = 0
                     WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, now_str, int(time.time()), ep_id])
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, now_str, int(time.time()), ep_id])
 
             # Store parsed erai_title for future searches
             parsed_erai = parse_erai_anime_title(v_name)
@@ -1435,7 +1530,7 @@ async def resolve_pending_episodes():
 async def check_pending_reviews():
     log_message("Checking pending reviews (non-CR grace period)...")
     pending = await execute_sql("""
-        SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.pixeldrain_1080_url,
+        SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.pixeldrain_1080_url, e.subtitles, e.audio_tracks,
                e.pending_review_until, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
@@ -1493,6 +1588,10 @@ async def check_pending_reviews():
                 dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, found_better["magnet"], found_better["title"])
                 size_mb = round(v_size / 1048576, 2)
                 stored_source = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(found_better['title'])}" if info_hash else found_better["magnet"]
+                subs_found, audio_found = inspect_media_tracks(v_path)
+                merged_subs = merge_track_lists(ep.get("subtitles"), subs_found)
+                merged_audio = merge_track_lists(ep.get("audio_tracks"), audio_found)
+
                 upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
                 if ep["pixeldrain_id"]:
                     delete_from_pixeldrain(ep["pixeldrain_id"])
@@ -1501,8 +1600,8 @@ async def check_pending_reviews():
                 now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 await execute_sql("""
                     UPDATE episodes SET status = 'ready', stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
-                        file_size_mb = ?, magnet_link = ?, uploaded_at = ?, pending_review_until = 0 WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, now_str, ep_id])
+                        file_size_mb = ?, magnet_link = ?, subtitles = ?, audio_tracks = ?, uploaded_at = ?, pending_review_until = 0 WHERE id = ?
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, merged_subs, merged_audio, now_str, ep_id])
                 log_message(f"Grace: replaced {romaji} Ep {ep_num} with CR Arabic version")
             except Exception as e:
                 log_message(f"Grace: failed to replace {romaji} Ep {ep_num}: {e}")
@@ -1514,7 +1613,7 @@ async def check_pending_reviews():
 async def check_audio_upgrades():
     log_message("Checking for quality upgrades...")
     recent_eps = await execute_sql("""
-        SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.audio_score, e.uploaded_at,
+        SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.audio_score, e.uploaded_at, e.subtitles, e.audio_tracks,
                a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
@@ -1563,6 +1662,10 @@ async def check_audio_upgrades():
                     f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(target['title'])}"
                     if info_hash else target["magnet"]
                 )
+                subs_found, audio_found = inspect_media_tracks(v_path)
+                merged_subs = merge_track_lists(ep.get("subtitles"), subs_found)
+                merged_audio = merge_track_lists(ep.get("audio_tracks"), audio_found)
+
                 upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
 
                 if ep["pixeldrain_id"]:
@@ -1573,9 +1676,9 @@ async def check_audio_upgrades():
                 await execute_sql("""
                     UPDATE episodes
                     SET stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
-                        file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?
+                        file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?, subtitles = ?, audio_tracks = ?
                     WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, ep["ep_id"]])
+                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, merged_subs, merged_audio, ep["ep_id"]])
 
                 log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
             except Exception as up_ex:
