@@ -1052,7 +1052,7 @@ async def sync_anilist_schedule():
 async def check_finished_anime_catchup():
     """Checks actively-tracked anime that finished with missing final episodes on AniList."""
     tracked_anime = await execute_sql("""
-        SELECT a.id, a.anilist_id, a.title_romaji, COUNT(e.id) as ready_count, MAX(e.episode_number) as max_ep
+        SELECT a.id, a.anilist_id, a.title_romaji, COUNT(e.id) as ready_count, MAX(CAST(e.episode_number AS INTEGER)) as max_ep
         FROM anime a
         JOIN episodes e ON a.id = e.anime_id
         WHERE e.status = 'ready' AND a.status = 'RELEASING'
@@ -1343,6 +1343,7 @@ async def resolve_pending_episodes():
 
         log_message(f"Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio Score: {audio_score})")
 
+        dl_dir = None
         try:
             dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
             size_mb = round(v_size / 1048576, 2)
@@ -1352,8 +1353,6 @@ async def resolve_pending_episodes():
             )
 
             upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
-            shutil.rmtree(dl_dir, ignore_errors=True)
-
             pd_id = upload["id"]
             pd_url = upload["url"]
 
@@ -1408,6 +1407,9 @@ async def resolve_pending_episodes():
         except Exception as ex:
             log_message(f"Failed to process {romaji} Ep {ep_num}: {ex}")
             await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
+        finally:
+            if dl_dir:
+                shutil.rmtree(dl_dir, ignore_errors=True)
 
 # ─── Pending Review Grace Period (Non-CR -> wait for CR with Arabic) ──
 async def check_pending_reviews():
@@ -1465,12 +1467,12 @@ async def check_pending_reviews():
                 break
         if found_better:
             log_message(f"Grace: CR with Arabic found for {romaji} Ep {ep_num}: {found_better['title']}")
+            dl_dir = None
             try:
                 dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, found_better["magnet"], found_better["title"])
                 size_mb = round(v_size / 1048576, 2)
                 stored_source = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(found_better['title'])}" if info_hash else found_better["magnet"]
                 upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
-                shutil.rmtree(dl_dir, ignore_errors=True)
                 if ep["pixeldrain_id"]:
                     delete_from_pixeldrain(ep["pixeldrain_id"])
                 pd_id = upload["id"]
@@ -1483,6 +1485,9 @@ async def check_pending_reviews():
                 log_message(f"Grace: replaced {romaji} Ep {ep_num} with CR Arabic version")
             except Exception as e:
                 log_message(f"Grace: failed to replace {romaji} Ep {ep_num}: {e}")
+            finally:
+                if dl_dir:
+                    shutil.rmtree(dl_dir, ignore_errors=True)
 
 # ─── Audio Upgrade Monitor ─────────────────────────────────────
 async def check_audio_upgrades():
@@ -1529,6 +1534,7 @@ async def check_audio_upgrades():
             new_score = get_audio_score(target["title"])
             log_message(f"Audio upgrade found for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score} using: {target['title']}")
             
+            dl_dir = None
             try:
                 dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
                 size_mb = round(v_size / 1048576, 2)
@@ -1537,7 +1543,6 @@ async def check_audio_upgrades():
                     if info_hash else target["magnet"]
                 )
                 upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
-                shutil.rmtree(dl_dir, ignore_errors=True)
 
                 if ep["pixeldrain_id"]:
                     delete_from_pixeldrain(ep["pixeldrain_id"])
@@ -1554,6 +1559,9 @@ async def check_audio_upgrades():
                 log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
             except Exception as up_ex:
                 log_message(f"Failed to apply audio upgrade for {romaji}: {up_ex}")
+            finally:
+                if dl_dir:
+                    shutil.rmtree(dl_dir, ignore_errors=True)
 
 # ─── Main Entry Point ──────────────────────────────────────────
 async def main():
