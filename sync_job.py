@@ -710,6 +710,10 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
     for base in search_bases:
         if not base:
             continue
+        # Targeted trusted group queries first to bypass Nyaa RSS 75-item date truncation on older episodes
+        if base in (r_base, e_base) or (erai_title and base == clean_and_strip(erai_title)):
+            queries.append(f'[Erai-raws] {base} "{ep_str}"')
+            queries.append(f'[SubsPlease] {base} "{ep_str}"')
         queries.append(f'{base} "{ep_str}"')
         queries.append(f'{base} {ep_str}')
         if is_special and ep == 1:
@@ -718,6 +722,9 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
         words = base.split()
         if len(words) > 3:
             short = " ".join(words[:3])
+            if base in (r_base, e_base):
+                queries.append(f'[Erai-raws] {short} "{ep_str}"')
+                queries.append(f'[SubsPlease] {short} "{ep_str}"')
             queries.append(f'{short} "{ep_str}"')
             queries.append(f'{short} {ep_str}')
             if is_special and ep == 1:
@@ -1372,7 +1379,7 @@ async def resolve_pending_episodes():
         
         all_results = []
         search_notes = []
-        for i in range(0, min(len(queries), 6), 2):
+        for i in range(0, min(len(queries), 8), 2):
             batch = queries[i:i+2]
             tasks = [
                 search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special)
