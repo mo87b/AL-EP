@@ -1295,8 +1295,10 @@ async def check_finished_anime_catchup():
 
 # ─── Main Episode Resolution Loop ─────────────────────────────
 async def resolve_pending_episodes():
-    log_message("Resolving pending episodes...")
-    cutoff_ts = int(time.time()) - (14 * 24 * 60 * 60)
+    now_ts = int(time.time())
+    cutoff_ts = now_ts - (14 * 24 * 60 * 60)
+    cooldown_ts = now_ts - 3600  # 1 hour cooldown for retrying not-found episodes
+
     pending_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.status, e.aired_at, e.last_checked,
                a.anilist_id, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
@@ -1304,12 +1306,27 @@ async def resolve_pending_episodes():
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'pending'
           AND e.aired_at >= ?
+          AND (e.last_checked IS NULL OR e.last_checked <= ?)
           AND CAST(e.episode_number AS INTEGER) = (
               SELECT MIN(CAST(e2.episode_number AS INTEGER)) FROM episodes e2
               WHERE e2.anime_id = e.anime_id AND e2.status = 'pending' AND e2.aired_at >= ?
+                AND (e2.last_checked IS NULL OR e2.last_checked <= ?)
           )
         ORDER BY e.aired_at DESC, e.last_checked ASC
-    """, [cutoff_ts, cutoff_ts])
+    """, [cutoff_ts, cooldown_ts, cutoff_ts, cooldown_ts])
+
+    # Fallback if all pending are in cooldown: retry oldest checked
+    if not pending_eps:
+        pending_eps = await execute_sql("""
+            SELECT e.id as ep_id, e.anime_id, e.episode_number, e.status, e.aired_at, e.last_checked,
+                   a.anilist_id, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
+            FROM episodes e
+            JOIN anime a ON e.anime_id = a.id
+            WHERE e.status = 'pending'
+              AND e.aired_at >= ?
+            ORDER BY e.aired_at DESC, e.last_checked ASC
+            LIMIT 5
+        """, [cutoff_ts])
 
     if not pending_eps:
         log_message("No pending episodes found.")
@@ -1400,8 +1417,11 @@ async def resolve_pending_episodes():
             return MIN_TORRENT_SEEDERS
 
         # Date sanity check: If torrent was published on Nyaa > 7 days BEFORE AniList airing date, it is an outdated/false-positive match
-        def is_valid_release_date(t_pub_date: int, ep_aired_at: int) -> bool:
+        def is_valid_release_date(t_title: str, t_pub_date: int, ep_aired_at: int) -> bool:
             if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
+                return True
+            # Trusted release groups (Erai-raws, SubsPlease, ToonsHub) always have authentic releases
+            if bool(re.search(r'\[?(erai[-_ ]?raws|subsplease|toonshub)\]?', t_title.lower())):
                 return True
             # Allow up to 7 days earlier in case of AniList slight schedule delay/early leaks
             if t_pub_date < (ep_aired_at - 7 * 86400):
@@ -1413,7 +1433,7 @@ async def resolve_pending_episodes():
             if r["seeders"] >= get_min_seeders_for_torrent(r["title"]) 
             and is_acceptable_torrent(r["title"]) 
             and not is_blacklisted_platform(r["title"])
-            and is_valid_release_date(r.get("pub_date", 0), aired_at)
+            and is_valid_release_date(r["title"], r.get("pub_date", 0), aired_at)
         ]
         if not good:
             hint = ""
