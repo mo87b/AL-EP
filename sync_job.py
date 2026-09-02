@@ -308,17 +308,55 @@ def is_blacklisted_platform(title: str) -> bool:
     return bool(re.search(r'\b(nf|netflix|iq|iqiyi)\b', title.lower()))
 
 def get_audio_score(title: str) -> int:
+    """
+    Score hierarchy:
+      4: Multi-Audio (e.g. MULTi-Audio / MULTi AAC)
+      3: Dual-Audio (e.g. DUAL / Dual-Audio / DUAL AAC)
+      2: Explicit Japanese Audio (e.g. (JA), (JP), Japanese Dub, Japanese Audio, WEB-DLJPN)
+      1: Default / Standard Japanese (clean anime release with no foreign audio tags)
+     -5: Foreign Single Audio Only (e.g. (KA), Korean Audio, (ZH), Chinese Dub, standalone English Dub)
+    """
     if not title or not isinstance(title, str):
         return 0
     t_lower = title.lower()
+
+    # 1. Multi-Audio (highest priority)
     if re.search(r'\bmulti[- ]audio\b|multiaudio|\bmulti\s+aac\b', t_lower):
+        return 4
+
+    # 2. Dual-Audio
+    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\s+aac\b|\bdual\b', t_lower):
+        return 3
+
+    # 3. Check for Explicit Foreign Audio Only (Korean, Chinese, English dub, etc. without Dual/Multi)
+    is_foreign = bool(re.search(
+        r'[\(\[]\s*(ka|ko|kor|zh|cn|chi)\s*[\)\]]|'
+        r'\b(korean|kor)\s*[-_ ]*(audio|dub)\b|'
+        r'\b(chinese|mandarin)\s*[-_ ]*(audio|dub)\b|'
+        r'\b(english|eng)\s*[-_ ]*dub\b|'
+        r'web-dl\s*(kor|chi)',
+        t_lower
+    ))
+
+    # 4. Explicit Japanese Audio
+    is_japanese = bool(re.search(
+        r'[\(\[]\s*(ja|jp|jpn)\s*[\)\]]|'
+        r'\b(japanese|jpn|jap)\s*[-_ ]*(audio|dub)\b|'
+        r'web-dl\s*jpn',
+        t_lower
+    ))
+
+    if is_foreign and not is_japanese:
+        return -5
+
+    if is_japanese:
         return 2
-    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\b', t_lower):
-        return 1
-    return 0
+
+    # 5. Default Japanese (standard anime release)
+    return 1
 
 def is_multi_audio_torrent(title: str) -> bool:
-    return get_audio_score(title) > 0
+    return get_audio_score(title) >= 3
 
 def get_platform_score(title: str) -> int:
     if not title or not isinstance(title, str):
@@ -462,10 +500,29 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
             words = get_clean_words(clean_t)
             if not words:
                 return False
-            # Use exact word boundary matching (\bword\b) to avoid matching single letters inside unrelated words
-            matching_words = [w for w in words if re.search(rf'\b{re.escape(w)}\b', torrent_title_lower)]
+
+            matching_words = set()
+            for w in words:
+                if re.search(rf'\b{re.escape(w)}\b', torrent_title_lower):
+                    matching_words.add(w)
+
+            # Check adjacent merged words (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
+            for i in range(len(words) - 1):
+                w1, w2 = words[i], words[i+1]
+                if len(w1) >= 2 and len(w2) >= 2:
+                    pair = w1 + w2
+                    if re.search(rf'\b{re.escape(pair)}\b', torrent_title_lower):
+                        matching_words.add(w1)
+                        matching_words.add(w2)
+
+            # Check if entire title with no spaces matches
+            if len(words) >= 2:
+                all_merged = "".join(words)
+                if re.search(rf'\b{re.escape(all_merged)}\b', torrent_title_lower):
+                    for w in words:
+                        matching_words.add(w)
+
             ratio = len(matching_words) / len(words)
-            
             if len(words) <= 2:
                 return len(matching_words) == len(words)
             if len(words) == 3:
@@ -526,6 +583,38 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
                 
         if extra_words:
             return False
+    else:
+        # Trusted groups (Erai-raws/ToonsHub): still check extra words
+        # but allow up to 2 extra (for codec tags like EAC3, Multiple)
+        torrent_clean = clean_title(torrent_title)
+        torrent_words = get_clean_words(torrent_clean)
+
+        anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
+        for syn in valid_synonyms:
+            if syn:
+                anime_words.update(get_clean_words(syn))
+
+        extra_words = []
+        concat_parts = set()
+        for i in range(len(torrent_words) - 1):
+            pair_word = torrent_words[i] + torrent_words[i+1]
+            if pair_word in anime_words:
+                concat_parts.add(torrent_words[i])
+                concat_parts.add(torrent_words[i+1])
+
+        for w in torrent_words:
+            if w in anime_words or w in concat_parts:
+                continue
+            is_concat = False
+            for w1 in anime_words:
+                if len(w1) >= 3 and w.startswith(w1) and w[len(w1):] in anime_words:
+                    is_concat = True
+                    break
+            if not is_concat:
+                extra_words.append(w)
+
+        if len(extra_words) > 2:
+            return False
 
     # 5. Source check: MUST be Multi-Sub release
     is_multi_sub = bool(re.search(
@@ -578,6 +667,12 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
         search_bases.append(r_super)
     if e_super and e_super not in search_bases:
         search_bases.append(e_super)
+
+    # Collapsed variations (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
+    if len(r_base.split()) >= 2:
+        r_collapsed = "".join(r_base.split())
+        if len(r_collapsed) >= 3 and r_collapsed not in search_bases:
+            search_bases.append(r_collapsed)
         
     # Japanese suffix / hyphen variations (e.g. Tenkousaki -> Tenkou-saki / Tenkou saki)
     COMMON_SUFFIXES = ["saki", "tabi", "gumi", "jima", "bashi", "mura", "kan", "sou", "ken", "chou"]
@@ -1437,7 +1532,7 @@ async def resolve_pending_episodes():
         winner = good[0]
         torrent_title = winner["title"]
         audio_score = get_audio_score(torrent_title)
-        is_multi_audio = 1 if audio_score >= 1 else 0
+        is_multi_audio = 1 if audio_score >= 3 else 0
 
         log_message(f"Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio Score: {audio_score})")
 
