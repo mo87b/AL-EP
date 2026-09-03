@@ -1495,50 +1495,54 @@ async def resolve_pending_episodes():
             else:
                 platforms_in_multi.add('other')
 
-        # Only do extra fetch if at least 2 different platforms with multi-subs
+        # Check detail pages if:
+        # 1. Multiple platforms in multi-subs (existing logic)
+        # 2. Or presence of a REPACK candidate alongside regular releases (new logic)
+        has_repack = any(bool(re.search(r'\b(repack|re-pack|v2)\b', r["title"].lower())) for r in good)
+        has_multiple_platforms = (len(multi_subs_candidates) >= 2 and len(platforms_in_multi) >= 2)
+        has_repack_check = (has_repack and len(good) >= 2)
+
         arabic_cache = {}
-        if len(multi_subs_candidates) >= 2 and len(platforms_in_multi) >= 2:
+        if has_multiple_platforms or has_repack_check:
             async def _check_arabic_for_item(item):
                 magnet = item.get("magnet", "")
-                # Derive view URL from download URL: /download/ -> /view/
                 view_url = None
                 if "nyaa.si/download/" in magnet:
                     view_url = magnet.replace("/download/", "/view/").split(".torrent")[0]
                 elif "nyaa.si/view/" in magnet:
                     view_url = magnet
                 else:
-                    # Try to use magnet as is (may be view page via proxy)
                     view_url = magnet
-                # Try GAS proxy for detail page or direct fetch
+
+                # 1. Direct fetch first
+                try:
+                    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+                        r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                        if r.status_code == 200 and "Subtitles Info" in r.text:
+                            return _has_arabic_variants(r.text)
+                except Exception:
+                    pass
+
+                # 2. GAS proxy fallback
                 for proxy_base in get_ordered_proxies():
                     try:
-                        # Nyaa view page is HTML, not JSON - try direct via proxy with view url
-                        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                            # Use proxy to fetch view page HTML via ?url= param if proxy supports it, else try direct
-                            # For now, try to fetch via proxy's torrent mode with view url
+                        async with httpx.AsyncClient(timeout=12.0, follow_redirects=True) as client:
                             gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
-                            # Alternative: try to fetch HTML directly via proxy's q param if it's a search proxy
-                            # Fallback to direct fetch of view_url
-                            r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0"})
-                            if r.status_code == 200 and "Subtitles Info" in r.text:
-                                return _has_arabic_variants(r.text)
-                            # Try via GAS proxy as search
                             r2 = await client.get(gas_url)
                             if r2.status_code == 200:
                                 try:
                                     data = r2.json()
                                     if data.get("data"):
-                                        import base64
                                         html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
                                         return _has_arabic_variants(html)
-                                except: pass
+                                except Exception:
+                                    pass
                                 return _has_arabic_variants(r2.text)
-                    except: continue
-                # If all fails, check title itself for Arabic hint (fallback)
-                return _has_arabic_variants(item.get("title",""))
+                    except Exception:
+                        continue
+                return _has_arabic_variants(item.get("title", ""))
 
-            # Run checks concurrently for all multi-subs candidates
-            check_tasks = [ _check_arabic_for_item(r) for r in good ]
+            check_tasks = [_check_arabic_for_item(r) for r in good]
             try:
                 results = await asyncio.gather(*check_tasks, return_exceptions=True)
                 for idx, res in enumerate(results):
@@ -1551,14 +1555,19 @@ async def resolve_pending_episodes():
             except Exception as e:
                 log_message(f"Arabic check failed: {e}")
 
-        # Smart Sort: Arabic (if checked) > Multi-Audio > Trusted Groups > Platform Score > Quality > Source > Seeders
+        # Smart Sort: Arabic (if checked) > REPACK preference > Multi-Audio > Trusted Groups > Platform Score > Quality > Source > Seeders
         def _arabic_score(item):
             return 1 if arabic_cache.get(item["magnet"], False) else 0
 
-        # Only apply Arabic priority if we actually checked (cache not empty)
-        if arabic_cache:
+        def _repack_score(item):
+            return 1 if re.search(r'\b(repack|re-pack|v2)\b', item["title"].lower()) else 0
+
+        any_arabic_found = any(arabic_cache.values()) if arabic_cache else False
+
+        if any_arabic_found:
             good.sort(key=lambda x: (
                 _arabic_score(x),
+                _repack_score(x),
                 get_audio_score(x["title"]),
                 1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
                 get_platform_score(x["title"]),
@@ -1569,6 +1578,7 @@ async def resolve_pending_episodes():
         else:
             good.sort(key=lambda x: (
                 get_audio_score(x["title"]),
+                _repack_score(x),
                 1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
                 get_platform_score(x["title"]),
                 get_quality_weight(x["title"]),
