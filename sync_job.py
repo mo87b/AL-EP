@@ -1388,7 +1388,7 @@ async def resolve_pending_episodes():
         # Late check: make sure episode wasn't already marked ready (e.g. uploaded by manual downloader while running)
         fresh_status = await execute_sql(
             "SELECT status, stream_url FROM episodes WHERE id = ?",
-            [ep["id"]]
+            [ep_id]
         )
         if fresh_status and fresh_status[0].get("status") == "ready" and fresh_status[0].get("stream_url"):
             log_message(f"Episode {ep_num} of {romaji} is already marked ready in DB; skipping download.")
