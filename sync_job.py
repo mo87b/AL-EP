@@ -39,7 +39,7 @@ SYNC_DAYS = int(os.environ.get("SYNC_DAYS", "12"))
 SYNC_SECONDS = SYNC_DAYS * 24 * 60 * 60
 MAX_DOWNLOADS_PER_RUN = int(os.environ.get("MAX_DOWNLOADS_PER_RUN", "5"))
 TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "300"))
-MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "7"))
+MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "10"))
 
 NYAA_TRACKERS = [
     "http://nyaa.tracker.wf:7777/announce",
@@ -361,6 +361,16 @@ def get_audio_score(title: str) -> int:
 
 def is_multi_audio_torrent(title: str) -> bool:
     return get_audio_score(title) >= 3
+
+def get_min_seeders_for_torrent(t_title: str, aired_at: int = 0) -> int:
+    now_ts = int(time.time())
+    is_erai = bool(re.search(r'\[?erai[-_ ]?raws\]?', t_title.lower()))
+    if is_erai and (aired_at > 0) and (now_ts - aired_at < 7200):
+        return 1
+    elif is_erai:
+        return 2
+    # ToonsHub and all other release groups require at least 10 seeders
+    return max(10, MIN_TORRENT_SEEDERS)
 
 def get_platform_score(title: str) -> int:
     if not title or not isinstance(title, str):
@@ -1450,14 +1460,6 @@ async def resolve_pending_episodes():
                 return get_platform_score(t_title) >= 3
             return True
 
-        def get_min_seeders_for_torrent(t_title: str) -> int:
-            is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_title.lower()))
-            if is_trusted and (aired_at > 0) and (now_ts - aired_at < 7200):
-                return 1
-            elif is_trusted:
-                return 2
-            return MIN_TORRENT_SEEDERS
-
         # Date sanity check: If torrent was published on Nyaa > 7 days BEFORE AniList airing date, it is an outdated/false-positive match
         def is_valid_release_date(t_title: str, t_pub_date: int, ep_aired_at: int) -> bool:
             if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
@@ -1472,7 +1474,7 @@ async def resolve_pending_episodes():
 
         good = [
             r for r in deduped 
-            if r["seeders"] >= get_min_seeders_for_torrent(r["title"]) 
+            if r["seeders"] >= get_min_seeders_for_torrent(r["title"], aired_at) 
             and is_acceptable_torrent(r["title"]) 
             and not is_blacklisted_platform(r["title"])
             and is_valid_release_date(r["title"], r.get("pub_date", 0), aired_at)
@@ -1733,6 +1735,8 @@ async def check_pending_reviews():
                     # Only consider CR
                     if get_platform_score(r["title"]) < 3:
                         continue
+                    if r.get("seeders", 0) < get_min_seeders_for_torrent(r["title"]):
+                        continue
                     if not bool(re.search(r'\b(multi|m)\s*[-_:]?\s*subs?\b|multisubs?', r["title"].lower())):
                         continue
                     # Check for Arabic in detail page (reuse cache from earlier Arabic check)
@@ -1808,7 +1812,8 @@ async def check_audio_upgrades():
                 res_list, _ = res
                 if res_list:
                     for r in res_list:
-                        if get_audio_score(r["title"]) > current_audio and r.get("seeders", 0) >= 1:
+                        min_s = get_min_seeders_for_torrent(r["title"])
+                        if get_audio_score(r["title"]) > current_audio and r.get("seeders", 0) >= min_s:
                             better.append(r)
             if better:
                 break
