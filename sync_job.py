@@ -13,6 +13,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 import email.utils
 import httpx
+import unicodedata
 
 # ─── Environment Configuration ──────────────────────────────────
 TURSO_URL = os.environ.get("TURSO_URL", "")
@@ -217,13 +218,20 @@ async def blacklist_anime(anime_id: int, anilist_id: int, title_romaji: str, rea
     log_message(f"Blacklisted anime: {title_romaji} (Reason: {reason})")
 
 # ─── Title & Episode Parsing Functions ─────────────────────────
+def strip_accents(text: str) -> str:
+    if not text or not isinstance(text, str):
+        return ""
+    normalized = unicodedata.normalize('NFKD', text)
+    return "".join(c for c in normalized if unicodedata.category(c) != 'Mn')
+
 def clean_title(title: str) -> str:
     if not title or not isinstance(title, str):
         return ""
+    title = strip_accents(title)
     title = re.sub(r'\(.*?\)', '', title)
     title = re.sub(r'\[.*?\]', '', title)
     title = re.sub(r'[:\\/*?"<>|]', ' ', title)
-    title = re.sub(r'[^a-zA-Z0-9\s\-\'\.]', '', title)
+    title = re.sub(r"[^a-zA-Z0-9\s\-'\.]", '', title)
     return re.sub(r'\s+', ' ', title).strip()
 
 def clean_and_strip(title: str) -> str:
@@ -677,6 +685,10 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
             if seg not in search_bases:
                 search_bases.append(seg)
     search_bases.extend([r_base, e_base])
+    raw_r = re.sub(r'[:\\/*?"<>|\[\]\(\)]', ' ', romaji).strip()
+    raw_r = re.sub(r'\s+', ' ', raw_r)
+    if raw_r and raw_r != r_base and raw_r not in search_bases:
+        search_bases.append(raw_r)
     if r_super and r_super not in search_bases:
         search_bases.append(r_super)
     if e_super and e_super not in search_bases:
