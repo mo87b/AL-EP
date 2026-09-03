@@ -321,11 +321,15 @@ def get_audio_score(title: str) -> int:
     t_lower = title.lower()
 
     # 1. Multi-Audio (highest priority)
-    if re.search(r'\bmulti[- ]audio\b|multiaudio|\bmulti\s+aac\b', t_lower):
+    if (re.search(r'\bmulti[-_ ]*audio\b|\bmultiaudio\b', t_lower) or
+        re.search(r'\bmulti[-_\.\s]*(aac|ddp|ac3|flac|opus|dts)', t_lower) or
+        re.search(r'[\.\[\(]multi[\.\]\)](?![-_\.\s]*sub)', t_lower)):
         return 4
 
     # 2. Dual-Audio
-    if re.search(r'\bdual[- ]audio\b|dualaudio|\bdual\s+aac\b|\bdual\b', t_lower):
+    if (re.search(r'\bdual[-_ ]*audio\b|\bdualaudio\b', t_lower) or
+        re.search(r'\bdual[-_\.\s]*(aac|ddp|ac3|flac|opus|dts)', t_lower) or
+        re.search(r'[\.\[\(]dual[\.\]\)]|\bdual\b', t_lower)):
         return 3
 
     # 3. Check for Explicit Foreign Audio Only (Korean, Chinese, English dub, etc. without Dual/Multi)
@@ -1379,6 +1383,15 @@ async def resolve_pending_episodes():
                 log_message(f"Ep1 grace expired but anime has available episodes; skipping blacklist: {romaji}")
             else:
                 await blacklist_anime(anime_id, anilist_id, romaji, "first_episode_grace_expired")
+            continue
+
+        # Late check: make sure episode wasn't already marked ready (e.g. uploaded by manual downloader while running)
+        fresh_status = await execute_sql(
+            "SELECT status, stream_url FROM episodes WHERE id = ?",
+            [ep["id"]]
+        )
+        if fresh_status and fresh_status[0].get("status") == "ready" and fresh_status[0].get("stream_url"):
+            log_message(f"Episode {ep_num} of {romaji} is already marked ready in DB; skipping download.")
             continue
 
         log_message(f"Searching torrents for: {romaji} (Ep {ep_num})")
