@@ -1361,7 +1361,6 @@ async def check_finished_anime_catchup():
 async def resolve_pending_episodes():
     now_ts = int(time.time())
     cutoff_ts = now_ts - (14 * 24 * 60 * 60)
-    cooldown_ts = now_ts - 3600  # 1 hour cooldown for retrying not-found episodes
 
     pending_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.status, e.aired_at, e.last_checked,
@@ -1370,27 +1369,12 @@ async def resolve_pending_episodes():
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'pending'
           AND e.aired_at >= ?
-          AND (e.last_checked IS NULL OR e.last_checked <= ?)
           AND CAST(e.episode_number AS INTEGER) = (
               SELECT MIN(CAST(e2.episode_number AS INTEGER)) FROM episodes e2
               WHERE e2.anime_id = e.anime_id AND e2.status = 'pending' AND e2.aired_at >= ?
-                AND (e2.last_checked IS NULL OR e2.last_checked <= ?)
           )
         ORDER BY e.aired_at DESC, e.last_checked ASC
-    """, [cutoff_ts, cooldown_ts, cutoff_ts, cooldown_ts])
-
-    # Fallback if all pending are in cooldown: retry oldest checked
-    if not pending_eps:
-        pending_eps = await execute_sql("""
-            SELECT e.id as ep_id, e.anime_id, e.episode_number, e.status, e.aired_at, e.last_checked,
-                   a.anilist_id, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
-            FROM episodes e
-            JOIN anime a ON e.anime_id = a.id
-            WHERE e.status = 'pending'
-              AND e.aired_at >= ?
-            ORDER BY e.aired_at DESC, e.last_checked ASC
-            LIMIT 5
-        """, [cutoff_ts])
+    """, [cutoff_ts, cutoff_ts])
 
     if not pending_eps:
         log_message("No pending episodes found.")
