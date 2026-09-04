@@ -523,26 +523,39 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
             if not words:
                 return False
 
+            t_variants = [
+                torrent_title_lower,
+                torrent_title_lower.replace("'", ""),
+                torrent_title_lower.replace("-", "").replace("'", ""),
+                torrent_title_lower.replace("-", " ").replace("'", "")
+            ]
+
             matching_words = set()
             for w in words:
-                if re.search(rf'\b{re.escape(w)}\b', torrent_title_lower):
-                    matching_words.add(w)
+                for tv in t_variants:
+                    if re.search(rf'\b{re.escape(w)}\b', tv):
+                        matching_words.add(w)
+                        break
 
             # Check adjacent merged words (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
             for i in range(len(words) - 1):
                 w1, w2 = words[i], words[i+1]
                 if len(w1) >= 2 and len(w2) >= 2:
                     pair = w1 + w2
-                    if re.search(rf'\b{re.escape(pair)}\b', torrent_title_lower):
-                        matching_words.add(w1)
-                        matching_words.add(w2)
+                    for tv in t_variants:
+                        if re.search(rf'\b{re.escape(pair)}\b', tv):
+                            matching_words.add(w1)
+                            matching_words.add(w2)
+                            break
 
             # Check if entire title with no spaces matches
             if len(words) >= 2:
                 all_merged = "".join(words)
-                if re.search(rf'\b{re.escape(all_merged)}\b', torrent_title_lower):
-                    for w in words:
-                        matching_words.add(w)
+                for tv in t_variants:
+                    if re.search(rf'\b{re.escape(all_merged)}\b', tv):
+                        for w in words:
+                            matching_words.add(w)
+                        break
 
             ratio = len(matching_words) / len(words)
             if len(words) <= 2:
@@ -678,29 +691,27 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
         e_super = re.sub(r'\s+', ' ', e_super).strip()
     
     search_bases = []
+    def _add_base(b):
+        if not b or not isinstance(b, str):
+            return
+        b_clean = b.strip()
+        if b_clean and b_clean.lower() not in [x.lower() for x in search_bases]:
+            search_bases.append(b_clean)
+
     if erai_title:
-        search_bases.append(clean_and_strip(erai_title))
+        _add_base(clean_and_strip(erai_title))
     for source_title in (romaji, english):
         for seg in _title_segments(source_title):
-            if seg not in search_bases:
-                search_bases.append(seg)
-    search_bases.extend([r_base, e_base])
+            _add_base(seg)
+    _add_base(r_base)
+    _add_base(e_base)
     raw_r = re.sub(r'[:\\/*?"<>|\[\]\(\)]', ' ', romaji).strip()
     raw_r = re.sub(r'\s+', ' ', raw_r)
-    if raw_r and raw_r != r_base and raw_r not in search_bases:
-        search_bases.append(raw_r)
-    if r_super and r_super not in search_bases:
-        search_bases.append(r_super)
-    if e_super and e_super not in search_bases:
-        search_bases.append(e_super)
+    _add_base(raw_r)
+    _add_base(r_super)
+    _add_base(e_super)
 
-    # Collapsed variations (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
-    if len(r_base.split()) >= 2:
-        r_collapsed = "".join(r_base.split())
-        if len(r_collapsed) >= 3 and r_collapsed not in search_bases:
-            search_bases.append(r_collapsed)
-        
-    # Japanese suffix / hyphen variations (e.g. Tenkousaki -> Tenkou-saki / Tenkou saki)
+    # Japanese suffix / hyphen variations (e.g. Tenkousaki -> Tenkou-saki / Tenkou saki, Kaikigumi -> Kaiki-gumi)
     COMMON_SUFFIXES = ["saki", "tabi", "gumi", "jima", "bashi", "mura", "kan", "sou", "ken", "chou"]
     for title_base in [r_base] + synonyms:
         if not title_base:
@@ -711,27 +722,25 @@ def get_search_queries(romaji: str, english: str, ep: int, synonyms: list = None
             if "-" in w:
                 unhyphen = w.replace("-", "")
                 spaced = w.replace("-", " ")
-                v1 = " ".join(c_words[:i] + [unhyphen] + c_words[i+1:])
-                v2 = " ".join(c_words[:i] + [spaced] + c_words[i+1:])
-                for var in (v1, v2):
-                    if var and var not in search_bases:
-                        search_bases.append(var)
+                _add_base(" ".join(c_words[:i] + [unhyphen] + c_words[i+1:]))
+                _add_base(" ".join(c_words[:i] + [spaced] + c_words[i+1:]))
             else:
                 for sfx in COMMON_SUFFIXES:
                     if w_lower.endswith(sfx) and len(w_lower) > len(sfx) + 2:
                         pfx = w[:-len(sfx)]
                         hyphen_var = f"{pfx}-{sfx}"
                         space_var = f"{pfx} {sfx}"
-                        v1 = " ".join(c_words[:i] + [hyphen_var] + c_words[i+1:])
-                        v2 = " ".join(c_words[:i] + [space_var] + c_words[i+1:])
-                        for var in (v1, v2):
-                            if var and var not in search_bases:
-                                search_bases.append(var)
-        
+                        _add_base(" ".join(c_words[:i] + [hyphen_var] + c_words[i+1:]))
+                        _add_base(" ".join(c_words[:i] + [space_var] + c_words[i+1:]))
+
+    # Collapsed variations (e.g. "Dogul Wang" -> "Dogulwang", "Chainsaw Man" -> "Chainsawman")
+    if len(r_base.split()) >= 2:
+        r_collapsed = "".join(r_base.split())
+        if len(r_collapsed) >= 3:
+            _add_base(r_collapsed)
+
     for syn in synonyms:
-        cleaned_syn = clean_and_strip(syn)
-        if cleaned_syn and cleaned_syn not in search_bases:
-            search_bases.append(cleaned_syn)
+        _add_base(clean_and_strip(syn))
             
     for base in search_bases:
         if not base:
@@ -1436,7 +1445,7 @@ async def resolve_pending_episodes():
         
         all_results = []
         search_notes = []
-        for i in range(0, min(len(queries), 10), 2):
+        for i in range(0, min(len(queries), 16), 2):
             batch = queries[i:i+2]
             tasks = [
                 search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special)
