@@ -372,7 +372,7 @@ def is_multi_audio_torrent(title: str) -> bool:
 
 def get_min_seeders_for_torrent(t_title: str, aired_at: int = 0) -> int:
     now_ts = int(time.time())
-    is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|subsplease|toonshub|varyg)\]?', t_title.lower()))
+    is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_title.lower()))
     if is_trusted:
         if (aired_at > 0) and (now_ts - aired_at < 7200):
             return 1
@@ -609,7 +609,7 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
 
     # 4. Extra words check on title scope (before episode marker)
     torrent_title_scope = torrent_title[:title_end_pos] if title_end_pos > 0 else torrent_title
-    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub|subsplease|varyg)\]?', t_lower))
+    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_lower))
     
     torrent_clean = clean_title(torrent_title_scope)
     torrent_words = get_clean_words(torrent_clean)
@@ -1436,7 +1436,7 @@ async def resolve_pending_episodes():
                     search_notes.append(res_note)
                 if res_list:
                     all_results.extend(res_list)
-            if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub|subsplease)\]?|\bvaryg\b', r["title"].lower())) for r in all_results):
+            if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', r["title"].lower())) for r in all_results):
                 break
             if len(all_results) >= 10:
                 break
@@ -1460,8 +1460,8 @@ async def resolve_pending_episodes():
         def is_valid_release_date(t_title: str, t_pub_date: int, ep_aired_at: int) -> bool:
             if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
                 return True
-            # Trusted release groups (Erai-raws, SubsPlease, ToonsHub, VARYG) always have authentic releases
-            if bool(re.search(r'\[?(erai[-_ ]?raws|subsplease|toonshub)\]?|\bvaryg\b', t_title.lower())):
+            # Trusted release groups (Erai-raws, ToonsHub, VARYG) always have authentic releases
+            if bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_title.lower())):
                 return True
             # Allow up to 7 days earlier in case of AniList slight schedule delay/early leaks
             if t_pub_date < (ep_aired_at - 7 * 86400):
@@ -1623,7 +1623,7 @@ async def resolve_pending_episodes():
 
         def _trusted_group_score(title: str) -> int:
             t = title.lower()
-            return 1 if bool(re.search(r'\[?(erai[-_ ]?raws|toonshub|subsplease)\]?|\bvaryg\b', t)) else 0
+            return 1 if bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t)) else 0
 
         if any_arabic_found:
             good.sort(key=lambda x: (
