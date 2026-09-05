@@ -39,8 +39,8 @@ def get_ordered_proxies() -> list:
 SYNC_DAYS = int(os.environ.get("SYNC_DAYS", "12"))
 SYNC_SECONDS = SYNC_DAYS * 24 * 60 * 60
 MAX_DOWNLOADS_PER_RUN = int(os.environ.get("MAX_DOWNLOADS_PER_RUN", "5"))
-TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "300"))
-MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "10"))
+TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "600"))
+MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "5"))
 
 NYAA_TRACKERS = [
     "http://nyaa.tracker.wf:7777/announce",
@@ -373,9 +373,7 @@ def is_multi_audio_torrent(title: str) -> bool:
 def get_min_seeders_for_torrent(t_title: str, aired_at: int = 0) -> int:
     now_ts = int(time.time())
     is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_title.lower()))
-    if is_trusted:
-        if (aired_at > 0) and (now_ts - aired_at < 7200):
-            return 1
+    if is_trusted and (aired_at > 0) and (now_ts - aired_at < 7200):
         return 2
     return max(5, MIN_TORRENT_SEEDERS)
 
@@ -1647,94 +1645,100 @@ async def resolve_pending_episodes():
                 x["seeders"]
             ), reverse=True)
 
-        winner = good[0]
-        torrent_title = winner["title"]
-        audio_score = get_audio_score(torrent_title)
-        is_multi_audio = 1 if audio_score >= 3 else 0
+        success = False
+        candidates = good[:3]
+        for cand_idx, winner in enumerate(candidates):
+            torrent_title = winner["title"]
+            audio_score = get_audio_score(torrent_title)
+            is_multi_audio = 1 if audio_score >= 3 else 0
 
-        log_message(f"Selected: {torrent_title} (Seeders: {winner['seeders']}, Audio Score: {audio_score})")
+            log_message(f"Selected candidate [{cand_idx+1}/{len(candidates)}]: {torrent_title} (Seeders: {winner['seeders']}, Audio Score: {audio_score})")
 
-        dl_dir = None
-        try:
-            dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
-            size_mb = round(v_size / 1048576, 2)
-            stored_source = (
-                f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(torrent_title)}"
-                if info_hash else winner["magnet"]
-            )
+            dl_dir = None
+            try:
+                dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, winner["magnet"], torrent_title)
+                size_mb = round(v_size / 1048576, 2)
+                stored_source = (
+                    f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(torrent_title)}"
+                    if info_hash else winner["magnet"]
+                )
 
-            subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
-            log_message(f"Tracks for {romaji} Ep {ep_num}: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
+                subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
+                log_message(f"Tracks for {romaji} Ep {ep_num}: Subs=[{subs_found}] Audio=[{audio_found}] Duration={duration_found}s")
 
-            upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
-            pd_id = upload["id"]
-            pd_url = upload["url"]
+                upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
+                pd_id = upload["id"]
+                pd_url = upload["url"]
 
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Grace period: if not CR and has no verified Arabic subtitles, keep as ready but still check for CR with Arabic for 1 hour (user sees episode immediately)
-            is_cr = get_platform_score(torrent_title) >= 3
-            has_arabic_subs = _has_arabic_variants(subs_found) or arabic_cache.get(winner.get("magnet", ""), False)
-            if not is_cr and not has_arabic_subs:
-                pending_until = int(time.time()) + 3600
-                await execute_sql("""
-                    UPDATE episodes 
-                    SET status = 'ready',
-                        stream_url = ?,
-                        pixeldrain_id = ?,
-                        pixeldrain_1080_url = ?,
-                        pixeldrain_1080_id = ?,
-                        file_size_mb = ?,
-                        magnet_link = ?,
-                        is_multi_audio = ?,
-                        audio_score = ?,
-                        subtitles = ?,
-                        audio_tracks = ?,
-                        subtitles_1080 = ?,
-                        audio_tracks_1080 = ?,
-                        duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
-                        uploaded_at = ?,
-                        last_checked = ?,
-                        pending_review_until = ?
-                    WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()), pending_until, ep_id])
-                log_message(f"Non-CR torrent for {romaji} Ep {ep_num} - visible as ready, grace period 1h until {pending_until} to wait for CR with Arabic")
-            else:
-                await execute_sql("""
-                    UPDATE episodes 
-                    SET status = 'ready',
-                        stream_url = ?,
-                        pixeldrain_id = ?,
-                        pixeldrain_1080_url = ?,
-                        pixeldrain_1080_id = ?,
-                        file_size_mb = ?,
-                        magnet_link = ?,
-                        is_multi_audio = ?,
-                        audio_score = ?,
-                        subtitles = ?,
-                        audio_tracks = ?,
-                        subtitles_1080 = ?,
-                        audio_tracks_1080 = ?,
-                        duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
-                        uploaded_at = ?,
-                        last_checked = ?,
-                        pending_review_until = 0
-                    WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()), ep_id])
+                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # Grace period: if not CR and has no verified Arabic subtitles, keep as ready but still check for CR with Arabic for 1 hour (user sees episode immediately)
+                is_cr = get_platform_score(torrent_title) >= 3
+                has_arabic_subs = _has_arabic_variants(subs_found) or arabic_cache.get(winner.get("magnet", ""), False)
+                if not is_cr and not has_arabic_subs:
+                    pending_until = int(time.time()) + 3600
+                    await execute_sql("""
+                        UPDATE episodes 
+                        SET status = 'ready',
+                            stream_url = ?,
+                            pixeldrain_id = ?,
+                            pixeldrain_1080_url = ?,
+                            pixeldrain_1080_id = ?,
+                            file_size_mb = ?,
+                            magnet_link = ?,
+                            is_multi_audio = ?,
+                            audio_score = ?,
+                            subtitles = ?,
+                            audio_tracks = ?,
+                            subtitles_1080 = ?,
+                            audio_tracks_1080 = ?,
+                            duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
+                            uploaded_at = ?,
+                            last_checked = ?,
+                            pending_review_until = ?
+                        WHERE id = ?
+                    """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()), pending_until, ep_id])
+                    log_message(f"Non-CR torrent for {romaji} Ep {ep_num} - visible as ready, grace period 1h until {pending_until} to wait for CR with Arabic")
+                else:
+                    await execute_sql("""
+                        UPDATE episodes 
+                        SET status = 'ready',
+                            stream_url = ?,
+                            pixeldrain_id = ?,
+                            pixeldrain_1080_url = ?,
+                            pixeldrain_1080_id = ?,
+                            file_size_mb = ?,
+                            magnet_link = ?,
+                            is_multi_audio = ?,
+                            audio_score = ?,
+                            subtitles = ?,
+                            audio_tracks = ?,
+                            subtitles_1080 = ?,
+                            audio_tracks_1080 = ?,
+                            duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
+                            uploaded_at = ?,
+                            last_checked = ?,
+                            pending_review_until = 0
+                        WHERE id = ?
+                    """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, now_str, int(time.time()), ep_id])
 
-            # Store parsed erai_title for future searches
-            parsed_erai = parse_erai_anime_title(v_name)
-            if parsed_erai and not erai_title:
-                await execute_sql("UPDATE anime SET erai_title = ? WHERE id = ?", [parsed_erai, anime_id])
+                # Store parsed erai_title for future searches
+                parsed_erai = parse_erai_anime_title(v_name)
+                if parsed_erai and not erai_title:
+                    await execute_sql("UPDATE anime SET erai_title = ? WHERE id = ?", [parsed_erai, anime_id])
 
-            log_message(f"Successfully processed {romaji} Ep {ep_num}")
-            downloads_count += 1
+                log_message(f"Successfully processed {romaji} Ep {ep_num}")
+                downloads_count += 1
+                success = True
+                break
+            except Exception as ex:
+                log_message(f"Candidate [{cand_idx+1}/{len(candidates)}] failed for {romaji} Ep {ep_num} ({torrent_title}): {ex}")
+            finally:
+                if dl_dir:
+                    shutil.rmtree(dl_dir, ignore_errors=True)
 
-        except Exception as ex:
-            log_message(f"Failed to process {romaji} Ep {ep_num}: {ex}")
+        if not success:
+            log_message(f"All candidates failed to process for {romaji} Ep {ep_num}")
             await execute_sql("UPDATE episodes SET last_checked = ? WHERE id = ?", [int(time.time()), ep_id])
-        finally:
-            if dl_dir:
-                shutil.rmtree(dl_dir, ignore_errors=True)
 
 # ─── Pending Review Grace Period (Non-CR -> wait for CR with Arabic) ──
 async def check_pending_reviews():
@@ -1831,7 +1835,9 @@ async def check_audio_upgrades():
                a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
-        WHERE e.status = 'ready' AND (e.audio_score < 2 OR e.audio_score IS NULL)
+        WHERE e.status = 'ready' 
+          AND (e.audio_score < 2 OR e.audio_score IS NULL)
+          AND (e.audio_upgrade_failed IS NULL OR e.audio_upgrade_failed = 0)
         ORDER BY e.id DESC
         LIMIT 15
     """)
@@ -1865,41 +1871,50 @@ async def check_audio_upgrades():
 
         if better:
             better.sort(key=lambda x: (get_audio_score(x["title"]), x["seeders"]), reverse=True)
-            target = better[0]
-            new_score = get_audio_score(target["title"])
-            log_message(f"Audio upgrade found for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score} using: {target['title']}")
-            
-            dl_dir = None
-            try:
-                dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
-                size_mb = round(v_size / 1048576, 2)
-                stored_source = (
-                    f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(target['title'])}"
-                    if info_hash else target["magnet"]
-                )
-                subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
+            candidates = better[:3]
+            upgrade_success = False
+            for cand_idx, target in enumerate(candidates):
+                new_score = get_audio_score(target["title"])
+                log_message(f"Audio upgrade attempt [{cand_idx+1}/{len(candidates)}] for {romaji} Ep {ep_num}! Upgrading score {current_audio} -> {new_score} using: {target['title']}")
+                
+                dl_dir = None
+                try:
+                    dl_dir, v_path, v_name, v_size, info_hash = await asyncio.to_thread(download_torrent, target["magnet"], target["title"])
+                    size_mb = round(v_size / 1048576, 2)
+                    stored_source = (
+                        f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(target['title'])}"
+                        if info_hash else target["magnet"]
+                    )
+                    subs_found, audio_found, duration_found = inspect_media_tracks(v_path)
 
-                upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
+                    upload = await asyncio.to_thread(upload_pixeldrain, v_path, v_name)
 
-                if ep["pixeldrain_id"]:
-                    delete_from_pixeldrain(ep["pixeldrain_id"])
+                    if ep["pixeldrain_id"]:
+                        delete_from_pixeldrain(ep["pixeldrain_id"])
 
-                pd_id = upload["id"]
-                pd_url = upload["url"]
-                await execute_sql("""
-                    UPDATE episodes
-                    SET stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
-                        file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?, subtitles = ?, audio_tracks = ?, subtitles_1080 = ?, audio_tracks_1080 = ?,
-                        duration = CASE WHEN ? > 0 THEN ? ELSE duration END
-                    WHERE id = ?
-                """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, ep["ep_id"]])
+                    pd_id = upload["id"]
+                    pd_url = upload["url"]
+                    await execute_sql("""
+                        UPDATE episodes
+                        SET stream_url = ?, pixeldrain_id = ?, pixeldrain_1080_url = ?, pixeldrain_1080_id = ?,
+                            file_size_mb = ?, magnet_link = ?, is_multi_audio = 1, audio_score = ?, subtitles = ?, audio_tracks = ?, subtitles_1080 = ?, audio_tracks_1080 = ?,
+                            duration = CASE WHEN ? > 0 THEN ? ELSE duration END,
+                            audio_upgrade_failed = 0
+                        WHERE id = ?
+                    """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, subs_found, audio_found, subs_found, audio_found, duration_found, duration_found, ep["ep_id"]])
 
-                log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
-            except Exception as up_ex:
-                log_message(f"Failed to apply audio upgrade for {romaji}: {up_ex}")
-            finally:
-                if dl_dir:
-                    shutil.rmtree(dl_dir, ignore_errors=True)
+                    log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
+                    upgrade_success = True
+                    break
+                except Exception as up_ex:
+                    log_message(f"Audio upgrade candidate [{cand_idx+1}/{len(candidates)}] failed for {romaji} Ep {ep_num}: {up_ex}")
+                finally:
+                    if dl_dir:
+                        shutil.rmtree(dl_dir, ignore_errors=True)
+
+            if not upgrade_success:
+                log_message(f"All audio upgrade candidates failed for {romaji} Ep {ep_num}. Marking audio_upgrade_failed = 1 to prevent re-attempts.")
+                await execute_sql("UPDATE episodes SET audio_upgrade_failed = 1 WHERE id = ?", [ep["ep_id"]])
 
 # ─── Schema Maintenance ────────────────────────────────────────
 async def ensure_database_schema():
@@ -1918,6 +1933,7 @@ async def ensure_database_schema():
             "mirror_480_missing": "INTEGER NOT NULL DEFAULT 0",
             "mirror_updated_at": "INTEGER",
             "pending_review_until": "INTEGER NOT NULL DEFAULT 0",
+            "audio_upgrade_failed": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, col_type in columns.items():
             if name not in existing:
