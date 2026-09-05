@@ -1436,7 +1436,7 @@ async def resolve_pending_episodes():
                     search_notes.append(res_note)
                 if res_list:
                     all_results.extend(res_list)
-            if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', r["title"].lower())) for r in all_results):
+            if any(r["seeders"] >= 50 and bool(re.search(r'\[?(erai[-_ ]?raws|toonshub|subsplease)\]?|\bvaryg\b', r["title"].lower())) for r in all_results):
                 break
             if len(all_results) >= 10:
                 break
@@ -1460,8 +1460,8 @@ async def resolve_pending_episodes():
         def is_valid_release_date(t_title: str, t_pub_date: int, ep_aired_at: int) -> bool:
             if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
                 return True
-            # Trusted release groups (Erai-raws, SubsPlease, ToonsHub) always have authentic releases
-            if bool(re.search(r'\[?(erai[-_ ]?raws|subsplease|toonshub)\]?', t_title.lower())):
+            # Trusted release groups (Erai-raws, SubsPlease, ToonsHub, VARYG) always have authentic releases
+            if bool(re.search(r'\[?(erai[-_ ]?raws|subsplease|toonshub)\]?|\bvaryg\b', t_title.lower())):
                 return True
             # Allow up to 7 days earlier in case of AniList slight schedule delay/early leaks
             if t_pub_date < (ep_aired_at - 7 * 86400):
@@ -1621,12 +1621,16 @@ async def resolve_pending_episodes():
 
         any_arabic_found = any(arabic_cache.values()) if arabic_cache else False
 
+        def _trusted_group_score(title: str) -> int:
+            t = title.lower()
+            return 1 if bool(re.search(r'\[?(erai[-_ ]?raws|toonshub|subsplease)\]?|\bvaryg\b', t)) else 0
+
         if any_arabic_found:
             good.sort(key=lambda x: (
                 _arabic_score(x),
                 _repack_score(x),
                 get_audio_score(x["title"]),
-                1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
+                _trusted_group_score(x["title"]),
                 get_platform_score(x["title"]),
                 get_quality_weight(x["title"]),
                 get_source_weight(x["title"]),
@@ -1636,7 +1640,7 @@ async def resolve_pending_episodes():
             good.sort(key=lambda x: (
                 get_audio_score(x["title"]),
                 _repack_score(x),
-                1 if ("[erai-raws]" in x["title"].lower() or "[toonshub]" in x["title"].lower()) else 0,
+                _trusted_group_score(x["title"]),
                 get_platform_score(x["title"]),
                 get_quality_weight(x["title"]),
                 get_source_weight(x["title"]),
