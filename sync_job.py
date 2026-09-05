@@ -1030,18 +1030,35 @@ def extract_skip_times(chapters: list, total_duration: int = 0) -> str:
     if not chapters or not isinstance(chapters, list):
         return None
 
-    OP_PATTERN = re.compile(r'\b(op|opening|intro|theme)\b|オープニング|opテーマ', re.IGNORECASE)
-    ED_PATTERN = re.compile(r'\b(ed|ending|outro|credits)\b|エンディング|edテーマ', re.IGNORECASE)
-    RECAP_PATTERN = re.compile(r'\b(recap|summary)\b|あらすじ|ダイジェスト', re.IGNORECASE)
+    OP_PATTERN = re.compile(r'\b(?:nc)?(?:op|opening|intro|theme)(?:[\s_]*\d+)?\b|オープニング|opテーマ', re.IGNORECASE)
+    ED_PATTERN = re.compile(r'\b(?:nc)?(?:ed|ending|outro|credits?)(?:[\s_]*\d+)?\b|エンディング|edテーマ', re.IGNORECASE)
+    RECAP_PATTERN = re.compile(r'\b(?:recap|summary|previously|catch[\s-]*up)\b|あらすじ|ダイジェスト|前回のあらすじ', re.IGNORECASE)
+
+    # Sort chapters by start_time
+    valid_chs = []
+    for ch in chapters:
+        if isinstance(ch, dict):
+            try:
+                s = float(ch.get("start_time", 0))
+                valid_chs.append((s, ch))
+            except (ValueError, TypeError):
+                continue
+    valid_chs.sort(key=lambda x: x[0])
 
     extracted = []
-    seen_types = set()
 
-    for ch in chapters:
-        if not isinstance(ch, dict):
-            continue
+    for i, (start_sec, ch) in enumerate(valid_chs):
         tags = ch.get("tags") or {}
-        title = (tags.get("title") or ch.get("title") or "").strip()
+        title = ""
+        for k, v in tags.items():
+            if k.lower() == "title" and isinstance(v, str):
+                title = v.strip()
+                break
+        if not title:
+            for k, v in ch.items():
+                if k.lower() == "title" and isinstance(v, str):
+                    title = v.strip()
+                    break
         if not title:
             continue
 
@@ -1062,22 +1079,30 @@ def extract_skip_times(chapters: list, total_duration: int = 0) -> str:
             continue
 
         try:
-            start_sec = float(ch.get("start_time", 0))
-            end_sec = float(ch.get("end_time", 0))
+            end_sec = float(ch.get("end_time") or 0)
         except (ValueError, TypeError):
-            continue
+            end_sec = 0.0
+
+        # Handle MKV simple chapters where end_time is implicit
+        if end_sec <= start_sec:
+            if i + 1 < len(valid_chs):
+                next_start = valid_chs[i + 1][0]
+                if next_start > start_sec:
+                    end_sec = next_start
+            elif total_duration and total_duration > start_sec:
+                end_sec = float(total_duration)
 
         dur = end_sec - start_sec
         if start_sec >= 0 and end_sec > start_sec and (15.0 <= dur <= 240.0):
-            key = f"{skip_type}_{round(start_sec, 1)}"
-            if key not in seen_types:
-                seen_types.add(key)
-                extracted.append({
-                    "skipType": skip_type,
-                    "startTime": round(start_sec, 2),
-                    "endTime": round(end_sec, 2),
-                    "title": clean_title or title
-                })
+            # Avoid duplicate intervals for same skip type within 30 seconds
+            if any(x["skipType"] == skip_type and abs(x["startTime"] - start_sec) < 30 for x in extracted):
+                continue
+            extracted.append({
+                "skipType": skip_type,
+                "startTime": round(start_sec, 2),
+                "endTime": round(end_sec, 2),
+                "title": clean_title or title
+            })
 
     if not extracted:
         return None
@@ -1125,7 +1150,7 @@ def inspect_media_tracks(video_path: str) -> tuple:
             "-show_format",
             "-show_streams",
             "-show_chapters",
-            "-show_entries", "stream=codec_type,duration:stream_tags=language,title:format=duration:chapter=start_time,end_time:chapter_tags=title",
+            "-show_entries", "stream=codec_type,duration:stream_tags=language,title:format=duration:chapter=start_time,end_time:chapter_tags=title,TITLE",
             video_path
         ]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
