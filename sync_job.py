@@ -41,6 +41,7 @@ SYNC_SECONDS = SYNC_DAYS * 24 * 60 * 60
 MAX_DOWNLOADS_PER_RUN = int(os.environ.get("MAX_DOWNLOADS_PER_RUN", "5"))
 TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "600"))
 MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "10"))
+MAX_AUDIO_UPGRADES_PER_RUN = int(os.environ.get("MAX_AUDIO_UPGRADES_PER_RUN", "2"))
 
 NYAA_TRACKERS = [
     "http://nyaa.tracker.wf:7777/announce",
@@ -1832,6 +1833,7 @@ async def check_pending_reviews():
 # ─── Audio Upgrade Monitor ─────────────────────────────────────
 async def check_audio_upgrades():
     log_message("Checking for quality upgrades...")
+    successful_upgrades = 0
     recent_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.audio_score, e.uploaded_at, e.subtitles, e.audio_tracks,
                a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
@@ -1845,6 +1847,10 @@ async def check_audio_upgrades():
     """)
 
     for ep in recent_eps:
+        if successful_upgrades >= MAX_AUDIO_UPGRADES_PER_RUN:
+            log_message(f"Reached audio upgrades limit ({MAX_AUDIO_UPGRADES_PER_RUN} successful) for this run.")
+            return
+
         current_audio = ep["audio_score"] or 0
         romaji = ep["title_romaji"]
         english = ep["title_english"]
@@ -1907,6 +1913,10 @@ async def check_audio_upgrades():
 
                     log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
                     upgrade_success = True
+                    successful_upgrades += 1
+                    if successful_upgrades >= MAX_AUDIO_UPGRADES_PER_RUN:
+                        log_message(f"Reached audio upgrades limit ({MAX_AUDIO_UPGRADES_PER_RUN} successful) for this run.")
+                        return
                     break
                 except Exception as up_ex:
                     log_message(f"Audio upgrade candidate [{cand_idx+1}/{len(candidates)}] failed for {romaji} Ep {ep_num}: {up_ex}")
