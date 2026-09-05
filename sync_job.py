@@ -372,13 +372,12 @@ def is_multi_audio_torrent(title: str) -> bool:
 
 def get_min_seeders_for_torrent(t_title: str, aired_at: int = 0) -> int:
     now_ts = int(time.time())
-    is_erai = bool(re.search(r'\[?erai[-_ ]?raws\]?', t_title.lower()))
-    if is_erai and (aired_at > 0) and (now_ts - aired_at < 7200):
-        return 1
-    elif is_erai:
+    is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|subsplease|toonshub|varyg)\]?', t_title.lower()))
+    if is_trusted:
+        if (aired_at > 0) and (now_ts - aired_at < 7200):
+            return 1
         return 2
-    # ToonsHub and all other release groups require at least 10 seeders
-    return max(10, MIN_TORRENT_SEEDERS)
+    return max(5, MIN_TORRENT_SEEDERS)
 
 def get_platform_score(title: str) -> int:
     if not title or not isinstance(title, str):
@@ -434,6 +433,9 @@ SEASON_STOPWORDS = {
 
 def get_clean_words(title: str) -> list:
     title_lower = title.lower()
+    # Strip video/audio codecs before stripping standalone numbers so 'h.264' doesn't leave stray 'h'
+    title_lower = re.sub(r'\b[hx][\.\-]?26[45](-[a-z0-9_]+)?\b', ' ', title_lower)
+    title_lower = re.sub(r'\b(aac|ddp|ac3|flac|dts)[\.\-]?\d*(\.\d+)?\b', ' ', title_lower)
     title_no_se = re.sub(r'\b(s\d+e\d+|s\d+|e\d+)\b', ' ', title_lower)
     title_no_num = re.sub(r'\b\d+\b', ' ', title_no_se)
     clean_t = title_no_num.replace('.', ' ').replace('-', ' ').replace("'", "")
@@ -454,7 +456,7 @@ def get_clean_words(title: str) -> list:
         w_stripped = w.strip("-'")
         if not w_stripped or w_stripped in SEASON_STOPWORDS or w_stripped in particles:
             continue
-        if len(w_stripped) >= 2 or (len(w_stripped) == 1 and w_stripped.isalnum()):
+        if len(w_stripped) >= 2 or (len(words) == 1 and w_stripped.isalnum()):
             filtered.append(w_stripped)
     return filtered
 
@@ -464,11 +466,12 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
     t_lower = torrent_title.lower()
     synonyms = synonyms or []
 
-    # 1. Episode matching check
+    # 1. Episode matching check and title scope identification
     m_ep = re.search(r'\b(?:s\d+)?e(\d+)\b', t_lower)
     if m_ep:
         if int(m_ep.group(1)) != ep:
             return False
+        title_end_pos = m_ep.start()
     else:
         bypass_ep_check = False
         if is_special and ep == 1:
@@ -476,11 +479,18 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
             other_ep_match = re.search(r'\b(?:ep|episode|ep\.|sp|special)?\s*0*([2-9]|\d{2,})\b', clean_title_for_ep)
             if not other_ep_match:
                 bypass_ep_check = True
+                title_end_pos = len(torrent_title)
                 
         if not bypass_ep_check:
-            ep_pattern = re.compile(rf'\b0*{ep}\b')
-            if not ep_pattern.search(t_lower):
-                return False
+            m_dash = re.search(r'\s+-\s+0*(\d+)\b', t_lower)
+            if m_dash and int(m_dash.group(1)) == ep:
+                title_end_pos = m_dash.start()
+            else:
+                ep_pattern = re.compile(rf'\b0*{ep}\b')
+                m_num = ep_pattern.search(t_lower)
+                if not m_num:
+                    return False
+                title_end_pos = m_num.start()
 
     # 2. Canonical Season & Part Enforcement
     torrent_season = get_season_number(torrent_title)
@@ -493,7 +503,19 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
         if eng_s > 1:
             target_season = eng_s
 
-    if torrent_season != target_season:
+    # Check if target_season was inferred solely from a trailing number in the base anime title (e.g. 'Thunder 3')
+    has_explicit_season_keyword = bool(
+        re.search(r'\b(?:season|cour|part|s\d+)\b|\b\d+(?:st|nd|rd|th)\s+season\b|\b(?:ii|iii|iv|v)\b', clean_romaji.lower()) or
+        (clean_english and re.search(r'\b(?:season|cour|part|s\d+)\b|\b\d+(?:st|nd|rd|th)\s+season\b|\b(?:ii|iii|iv|v)\b', clean_english.lower()))
+    )
+    is_trailing_title_number = (
+        not has_explicit_season_keyword and 
+        (bool(re.search(rf'\s+{target_season}$', clean_romaji.lower().strip())) or
+         (clean_english and bool(re.search(rf'\s+{target_season}$', clean_english.lower().strip()))))
+    )
+
+    season_matches = (torrent_season == target_season) or (is_trailing_title_number and (torrent_season == 1 or target_season == 1))
+    if not season_matches:
         return False
 
     target_part = get_part_number(clean_romaji) or (get_part_number(clean_english) if english else 0)
@@ -585,71 +607,40 @@ def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, 
     if not romaji_match and not eng_match and not syn_match:
         return False
 
-    # 4. Extra words check (with Japanese concatenation check)
-    clean_matched_words = get_clean_words(romaji)
-    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?', t_lower)) and len(clean_matched_words) >= 2
-    if not is_trusted_group:
-        torrent_clean = clean_title(torrent_title)
-        torrent_words = get_clean_words(torrent_clean)
-        
-        anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
-        for syn in valid_synonyms:
-            if syn:
-                anime_words.update(get_clean_words(syn))
-                
-        extra_words = []
-        concat_parts = set()
-        for i in range(len(torrent_words) - 1):
-            pair_word = torrent_words[i] + torrent_words[i+1]
-            if pair_word in anime_words:
-                concat_parts.add(torrent_words[i])
-                concat_parts.add(torrent_words[i+1])
+    # 4. Extra words check on title scope (before episode marker)
+    torrent_title_scope = torrent_title[:title_end_pos] if title_end_pos > 0 else torrent_title
+    is_trusted_group = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub|subsplease|varyg)\]?', t_lower))
+    
+    torrent_clean = clean_title(torrent_title_scope)
+    torrent_words = get_clean_words(torrent_clean)
+    
+    anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
+    for syn in valid_synonyms:
+        if syn:
+            anime_words.update(get_clean_words(syn))
+            
+    extra_words = []
+    concat_parts = set()
+    for i in range(len(torrent_words) - 1):
+        pair_word = torrent_words[i] + torrent_words[i+1]
+        if pair_word in anime_words:
+            concat_parts.add(torrent_words[i])
+            concat_parts.add(torrent_words[i+1])
 
-        for w in torrent_words:
-            if w in anime_words or w in concat_parts:
-                continue
-            is_concat = False
-            for w1 in anime_words:
-                if len(w1) >= 3 and w.startswith(w1) and w[len(w1):] in anime_words:
-                    is_concat = True
-                    break
-            if not is_concat:
-                extra_words.append(w)
-                
-        if extra_words:
-            return False
-    else:
-        # Trusted groups (Erai-raws/ToonsHub): still check extra words
-        # but allow up to 2 extra (for codec tags like EAC3, Multiple)
-        torrent_clean = clean_title(torrent_title)
-        torrent_words = get_clean_words(torrent_clean)
-
-        anime_words = set(get_clean_words(romaji) + (get_clean_words(english) if english else []))
-        for syn in valid_synonyms:
-            if syn:
-                anime_words.update(get_clean_words(syn))
-
-        extra_words = []
-        concat_parts = set()
-        for i in range(len(torrent_words) - 1):
-            pair_word = torrent_words[i] + torrent_words[i+1]
-            if pair_word in anime_words:
-                concat_parts.add(torrent_words[i])
-                concat_parts.add(torrent_words[i+1])
-
-        for w in torrent_words:
-            if w in anime_words or w in concat_parts:
-                continue
-            is_concat = False
-            for w1 in anime_words:
-                if len(w1) >= 3 and w.startswith(w1) and w[len(w1):] in anime_words:
-                    is_concat = True
-                    break
-            if not is_concat:
-                extra_words.append(w)
-
-        if len(extra_words) > 2:
-            return False
+    for w in torrent_words:
+        if w in anime_words or w in concat_parts:
+            continue
+        is_concat = False
+        for w1 in anime_words:
+            if len(w1) >= 3 and w.startswith(w1) and w[len(w1):] in anime_words:
+                is_concat = True
+                break
+        if not is_concat:
+            extra_words.append(w)
+            
+    max_extra = 2 if is_trusted_group else 0
+    if len(extra_words) > max_extra:
+        return False
 
     # 5. Source check: MUST be Multi-Sub release
     is_multi_sub = bool(re.search(
