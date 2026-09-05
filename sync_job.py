@@ -40,7 +40,7 @@ SYNC_DAYS = int(os.environ.get("SYNC_DAYS", "12"))
 SYNC_SECONDS = SYNC_DAYS * 24 * 60 * 60
 MAX_DOWNLOADS_PER_RUN = int(os.environ.get("MAX_DOWNLOADS_PER_RUN", "5"))
 TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "600"))
-MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "5"))
+MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "10"))
 
 NYAA_TRACKERS = [
     "http://nyaa.tracker.wf:7777/announce",
@@ -373,9 +373,11 @@ def is_multi_audio_torrent(title: str) -> bool:
 def get_min_seeders_for_torrent(t_title: str, aired_at: int = 0) -> int:
     now_ts = int(time.time())
     is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_title.lower()))
-    if is_trusted and (aired_at > 0) and (now_ts - aired_at < 7200):
-        return 2
-    return max(5, MIN_TORRENT_SEEDERS)
+    if is_trusted:
+        if (aired_at > 0) and (now_ts - aired_at < 7200):
+            return 2
+        return 8
+    return max(10, MIN_TORRENT_SEEDERS)
 
 def get_platform_score(title: str) -> int:
     if not title or not isinstance(title, str):
