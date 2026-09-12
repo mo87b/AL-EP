@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 import email.utils
 import httpx
 import unicodedata
+import base64
 
 # ─── Environment Configuration ──────────────────────────────────
 TURSO_URL = os.environ.get("TURSO_URL", "")
@@ -42,6 +43,7 @@ MAX_DOWNLOADS_PER_RUN = int(os.environ.get("MAX_DOWNLOADS_PER_RUN", "5"))
 TORRENT_DOWNLOAD_TIMEOUT = int(os.environ.get("TORRENT_DOWNLOAD_TIMEOUT", "600"))
 MIN_TORRENT_SEEDERS = int(os.environ.get("MIN_TORRENT_SEEDERS", "10"))
 MAX_AUDIO_UPGRADES_PER_RUN = int(os.environ.get("MAX_AUDIO_UPGRADES_PER_RUN", "2"))
+GRACE_PERIOD_SECONDS = int(os.environ.get("GRACE_PERIOD_SECONDS", "7200"))  # 2 hours wait period for CR with Arabic
 
 NYAA_TRACKERS = [
     "http://nyaa.tracker.wf:7777/announce",
@@ -946,6 +948,70 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
             
     return [], last_err or f"'{tag}' all proxies failed"
 
+# ─── Arabic Subtitle Inspection Helpers ────────────────────────
+ARABIC_CACHE = {}
+
+def has_arabic_variants(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    # All Arabic variants: ara, ar, arabic, العربية, عربي
+    return bool(re.search(r'\barabic\b|\bara\b|(?<!\w)ar(?!\w)|العربية|عربي', t))
+
+async def check_arabic_for_item(item: dict) -> bool:
+    magnet = item.get("magnet", "")
+    if magnet and magnet in ARABIC_CACHE:
+        return ARABIC_CACHE[magnet]
+
+    view_url = None
+    if "nyaa.si/download/" in magnet:
+        view_url = magnet.replace("/download/", "/view/").split(".torrent")[0]
+    elif "nyaa.si/view/" in magnet:
+        view_url = magnet
+    else:
+        view_url = magnet
+
+    # 1. Direct fetch first
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=10.0, follow_redirects=True) as client:
+            r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            if r.status_code == 200:
+                has_ar = has_arabic_variants(r.text)
+                if magnet:
+                    ARABIC_CACHE[magnet] = has_ar
+                return has_ar
+    except Exception:
+        pass
+
+    # 2. GAS proxy fallback
+    for proxy_base in get_ordered_proxies():
+        try:
+            async with httpx.AsyncClient(trust_env=False, timeout=12.0, follow_redirects=True) as client:
+                gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
+                r2 = await client.get(gas_url)
+                if r2.status_code == 200:
+                    try:
+                        data = r2.json()
+                        if data.get("data"):
+                            html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
+                            has_ar = has_arabic_variants(html)
+                            if magnet:
+                                ARABIC_CACHE[magnet] = has_ar
+                            return has_ar
+                    except Exception:
+                        pass
+                    has_ar = has_arabic_variants(r2.text)
+                    if magnet:
+                        ARABIC_CACHE[magnet] = has_ar
+                    return has_ar
+        except Exception:
+            continue
+
+    has_ar = has_arabic_variants(item.get("title", ""))
+    if magnet:
+        ARABIC_CACHE[magnet] = has_ar
+    return has_ar
+
 # ─── aria2c Downloader & Pixeldrain Uploader ──────────────────
 def is_valid_torrent_data(data: bytes) -> bool:
     """Verifies that bytes represent a valid bencoded torrent file (starts with 'd' and is not HTML)."""
@@ -1546,80 +1612,19 @@ async def resolve_pending_episodes():
                 return get_platform_score(t_title) >= 3
             return True
 
-        # Date sanity check: If torrent was published on Nyaa > 7 days BEFORE AniList airing date, it is an outdated/false-positive match
+        # Date sanity check: If torrent was published on Nyaa > 15 days BEFORE AniList airing date, it is an outdated/false-positive match
         def is_valid_release_date(t_title: str, t_pub_date: int, ep_aired_at: int) -> bool:
             if not t_pub_date or not ep_aired_at or ep_aired_at <= 0:
                 return True
-            # Trusted release groups (Erai-raws, ToonsHub, VARYG) always have authentic releases
-            if bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_title.lower())):
-                return True
-            # Allow up to 7 days earlier in case of AniList slight schedule delay/early leaks
-            if t_pub_date < (ep_aired_at - 7 * 86400):
+            # Allow up to 15 days earlier in case of AniList slight schedule delay/early leaks
+            if t_pub_date < (ep_aired_at - 15 * 86400):
                 return False
             return True
 
-        # ── Arabic Subtitle Inspection Helper ───────────────────────
-        def _has_arabic_variants(text: str) -> bool:
-            if not text: return False
-            t = text.lower()
-            # All Arabic variants: ara, ar, arabic, العربية, عربي
-            return bool(re.search(r'\barabic\b|\bara\b|(?<!\w)ar(?!\w)|العربية|عربي', t))
-
-        arabic_cache = {}
-
-        async def _check_arabic_for_item(item):
-            magnet = item.get("magnet", "")
-            if magnet and magnet in arabic_cache:
-                return arabic_cache[magnet]
-
-            view_url = None
-            if "nyaa.si/download/" in magnet:
-                view_url = magnet.replace("/download/", "/view/").split(".torrent")[0]
-            elif "nyaa.si/view/" in magnet:
-                view_url = magnet
-            else:
-                view_url = magnet
-
-            # 1. Direct fetch first
-            try:
-                async with httpx.AsyncClient(trust_env=False, timeout=10.0, follow_redirects=True) as client:
-                    r = await client.get(view_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-                    if r.status_code == 200:
-                        has_ar = _has_arabic_variants(r.text)
-                        if magnet:
-                            arabic_cache[magnet] = has_ar
-                        return has_ar
-            except Exception:
-                pass
-
-            # 2. GAS proxy fallback
-            for proxy_base in get_ordered_proxies():
-                try:
-                    async with httpx.AsyncClient(trust_env=False, timeout=12.0, follow_redirects=True) as client:
-                        gas_url = f"{proxy_base}?mode=torrent&url={urllib.parse.quote(view_url)}"
-                        r2 = await client.get(gas_url)
-                        if r2.status_code == 200:
-                            try:
-                                data = r2.json()
-                                if data.get("data"):
-                                    html = base64.b64decode(data["data"]).decode('utf-8', errors='ignore')
-                                    has_ar = _has_arabic_variants(html)
-                                    if magnet:
-                                        arabic_cache[magnet] = has_ar
-                                    return has_ar
-                            except Exception:
-                                pass
-                            has_ar = _has_arabic_variants(r2.text)
-                            if magnet:
-                                arabic_cache[magnet] = has_ar
-                            return has_ar
-                except Exception:
-                    continue
-
-            has_ar = _has_arabic_variants(item.get("title", ""))
-            if magnet:
-                arabic_cache[magnet] = has_ar
-            return has_ar
+        # ── Arabic Subtitle Inspection Aliases ───────────────────────
+        _has_arabic_variants = has_arabic_variants
+        _check_arabic_for_item = check_arabic_for_item
+        arabic_cache = ARABIC_CACHE
 
         PLATFORM_HOLD_SECONDS = 7200  # 2 hours wait period for blacklisted platforms (to give Crunchyroll a chance)
 
@@ -1763,11 +1768,11 @@ async def resolve_pending_episodes():
                 pd_url = upload["url"]
 
                 now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                # Grace period: if not CR and has no verified Arabic subtitles, keep as ready but still check for CR with Arabic for 1 hour (user sees episode immediately)
+                # Grace period: if not CR and has no verified Arabic subtitles, keep as ready but still check for CR with Arabic (user sees episode immediately)
                 is_cr = get_platform_score(torrent_title) >= 3
                 has_arabic_subs = _has_arabic_variants(subs_found) or arabic_cache.get(winner.get("magnet", ""), False)
                 if not is_cr and not has_arabic_subs:
-                    pending_until = int(time.time()) + 3600
+                    pending_until = int(time.time()) + GRACE_PERIOD_SECONDS
                     await execute_sql("""
                         UPDATE episodes 
                         SET status = 'ready',
@@ -1790,7 +1795,8 @@ async def resolve_pending_episodes():
                             pending_review_until = ?
                         WHERE id = ?
                     """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()), pending_until, ep_id])
-                    log_message(f"Non-CR torrent for {romaji} Ep {ep_num} - visible as ready, grace period 1h until {pending_until} to wait for CR with Arabic")
+                    grace_hours = max(1, GRACE_PERIOD_SECONDS // 3600)
+                    log_message(f"Non-CR torrent for {romaji} Ep {ep_num} - visible as ready, grace period {grace_hours}h until {pending_until} to wait for CR with Arabic")
                 else:
                     await execute_sql("""
                         UPDATE episodes 
@@ -1865,8 +1871,9 @@ async def check_pending_reviews():
         erai_title = ep.get("erai_title")
         is_special = ep.get("format") in ["SPECIAL", "MOVIE", "OVA", "ONA"]
         queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special, erai_title=erai_title)
-        found_better = None
-        for i in range(0, min(len(queries), 4), 2):
+        cr_candidates = []
+        seen_magnets = set()
+        for i in range(0, min(len(queries), 8), 2):
             batch = queries[i:i+2]
             tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special) for q in batch]
             batch_res = await asyncio.gather(*tasks, return_exceptions=True)
@@ -1875,21 +1882,35 @@ async def check_pending_reviews():
                     continue
                 res_list, _ = res
                 for r in res_list:
+                    m = r.get("magnet", "")
+                    if not m or m in seen_magnets:
+                        continue
                     # Only consider CR
                     if get_platform_score(r["title"]) < 3:
                         continue
                     if r.get("seeders", 0) < get_min_seeders_for_torrent(r["title"]):
                         continue
-                    if not bool(re.search(r'\b(multi|m)\s*[-_:]?\s*subs?\b|multisubs?', r["title"].lower())):
+                    # Must be multi-sub or title explicitly mentions arabic
+                    if not (bool(re.search(r'\b(multi|m)\s*[-_:]?\s*subs?\b|multisubs?', r["title"].lower())) or has_arabic_variants(r["title"])):
                         continue
-                    # Check for Arabic in detail page (reuse cache from earlier Arabic check)
-                    # For pending review, we do a quick title check for Arabic as proxy
-                    if re.search(r'\barabic\b|\bara\b|العربية|عربي', r["title"].lower()):
-                        found_better = r
-                        break
-                if found_better:
-                    break
-            if found_better:
+                    seen_magnets.add(m)
+                    cr_candidates.append(r)
+            if len(cr_candidates) >= 6:
+                break
+
+        # Sort candidates: prefer trusted groups (Erai, ToonsHub, VARYG), then 1080p quality, then seeders
+        cr_candidates.sort(key=lambda x: (
+            1 if bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', x["title"].lower())) else 0,
+            get_quality_weight(x["title"]),
+            x.get("seeders", 0)
+        ), reverse=True)
+
+        found_better = None
+        for cand in cr_candidates:
+            # Check detail page or title for Arabic subtitles
+            has_ar = await check_arabic_for_item(cand)
+            if has_ar:
+                found_better = cand
                 break
         if found_better:
             log_message(f"Grace: CR with Arabic found for {romaji} Ep {ep_num}: {found_better['title']}")
