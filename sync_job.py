@@ -21,6 +21,11 @@ TURSO_URL = os.environ.get("TURSO_URL", "")
 TURSO_TOKEN = os.environ.get("TURSO_TOKEN", "")
 PIXELDRAIN_API_KEY = os.environ.get("PIXELDRAIN_API_KEY", "")
 
+TELEGRAM_API_ID = int(os.environ.get("TELEGRAM_API_ID", "0").strip() or "0")
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHANNEL_ID = int(os.environ.get("TELEGRAM_CHANNEL_ID", "0").strip() or "0")
+
 GAS_PROXIES = []
 for _k in ["GAS_PROXY_URL", "GAS_PROXY_URL_2", "GAS_PROXY_URL_3"]:
     _v = os.environ.get(_k, "").strip()
@@ -157,17 +162,33 @@ async def ensure_database_schema():
     
     columns_to_add = [
         "is_multi_audio INTEGER DEFAULT 0", "audio_score INTEGER DEFAULT 0", "erai_title TEXT", 
+        "duration INTEGER",
         "backup_720_url TEXT", "backup_720_id TEXT", "backup_480_url TEXT", "backup_480_id TEXT",
         "pending_review_until INTEGER DEFAULT 0", "subtitles TEXT", "audio_tracks TEXT",
         "subtitles_1080 TEXT", "audio_tracks_1080 TEXT",
         "subtitles_720 TEXT", "audio_tracks_720 TEXT",
         "subtitles_480 TEXT", "audio_tracks_480 TEXT",
-        "skip_times TEXT"
+        "pixeldrain_1080_url TEXT", "pixeldrain_1080_id TEXT",
+        "mirror_720_missing INTEGER NOT NULL DEFAULT 0",
+        "mirror_480_missing INTEGER NOT NULL DEFAULT 0",
+        "mirror_updated_at INTEGER",
+        "audio_upgrade_failed INTEGER NOT NULL DEFAULT 0",
+        "skip_times TEXT",
+        "telegram_file_id TEXT", "telegram_message_id INTEGER"
     ]
     for col in columns_to_add:
         col_name = col.split()[0]
         if col_name not in existing:
             await execute_sql(f"ALTER TABLE episodes ADD COLUMN {col}")
+
+    try:
+        anime_cols = await execute_sql("PRAGMA table_info(anime)")
+        anime_existing = {row["name"] for row in anime_cols or [] if isinstance(row, dict) and "name" in row}
+        if "mal_id" not in anime_existing:
+            await execute_sql("ALTER TABLE anime ADD COLUMN mal_id INTEGER")
+            log_message("Added column 'mal_id' to anime table.")
+    except Exception as e:
+        log_message(f"Anime schema maintenance notice: {e}")
 
     # Self-healing: Reset any stuck processing episodes from crashed runs
     try:
@@ -1289,6 +1310,171 @@ def delete_from_pixeldrain(file_id: str) -> bool:
     except Exception:
         return False
 
+# ─── Telegram Backup Uploader ──────────────────────────────────
+def is_telegram_configured() -> bool:
+    return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID)
+
+async def upload_to_telegram(file_path: str, filename: str = None, caption: str = "") -> dict:
+    if not is_telegram_configured():
+        log_message("Telegram backup: credentials not configured, skipping.")
+        return None
+
+    if not os.path.exists(file_path):
+        log_message(f"Telegram backup: file not found at {file_path}")
+        return None
+
+    target_name = filename or os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+
+    # Telegram MTProto limit for bot uploads is 2GB
+    if file_size > 2000 * 1024 * 1024:
+        log_message(f"Telegram backup skipped: file size ({round(file_size / 1048576, 2)} MB) exceeds 2GB limit.")
+        return None
+
+    try:
+        import pyrogram.utils
+        pyrogram.utils.MIN_CHANNEL_ID = -10099999999999
+        from pyrogram import Client
+
+        log_message(f"Telegram backup: uploading {target_name} ({round(file_size / 1048576, 2)} MB)...")
+
+        async with Client(
+            "telegram_backup_session",
+            api_id=TELEGRAM_API_ID,
+            api_hash=TELEGRAM_API_HASH,
+            bot_token=TELEGRAM_BOT_TOKEN,
+            in_memory=True
+        ) as app:
+            is_video = target_name.lower().endswith((".mp4", ".mkv", ".webm", ".avi", ".mov"))
+            if is_video:
+                msg = await app.send_video(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    video=file_path,
+                    caption=caption or target_name,
+                    file_name=target_name,
+                    supports_streaming=True
+                )
+                media = msg.video or msg.document or msg.animation
+            else:
+                msg = await app.send_document(
+                    chat_id=TELEGRAM_CHANNEL_ID,
+                    document=file_path,
+                    caption=caption or target_name,
+                    file_name=target_name
+                )
+                media = msg.document
+
+            media_file_id = getattr(media, "file_id", "")
+            log_message(f"Telegram backup: successfully uploaded (message_id={msg.id})")
+            return {
+                "message_id": msg.id,
+                "channel_id": TELEGRAM_CHANNEL_ID,
+                "file_size": file_size,
+                "file_name": target_name,
+                "file_id": media_file_id,
+            }
+    except Exception as e:
+        log_message(f"Telegram backup failed for {target_name}: {e}")
+        return None
+
+_mal_id_cache = {}
+
+async def get_mal_id(anime_id: int = None, anilist_id: int = None) -> int:
+    """Returns mal_id for an anime. If missing in DB, queries AniList, caches and stores in anime.mal_id in Turso."""
+    if anilist_id and anilist_id in _mal_id_cache:
+        return _mal_id_cache[anilist_id]
+
+    # 1. Check local DB
+    if anilist_id:
+        try:
+            rows = await execute_sql("SELECT mal_id FROM anime WHERE anilist_id = ? AND mal_id IS NOT NULL AND mal_id > 0 LIMIT 1", [anilist_id])
+            if rows and rows[0].get("mal_id"):
+                val = int(rows[0]["mal_id"])
+                _mal_id_cache[anilist_id] = val
+                return val
+        except Exception:
+            pass
+    if anime_id:
+        try:
+            rows = await execute_sql("SELECT anilist_id, mal_id FROM anime WHERE id = ? LIMIT 1", [anime_id])
+            if rows:
+                if rows[0].get("mal_id"):
+                    val = int(rows[0]["mal_id"])
+                    if rows[0].get("anilist_id"):
+                        _mal_id_cache[rows[0]["anilist_id"]] = val
+                    return val
+                if not anilist_id:
+                    anilist_id = rows[0].get("anilist_id")
+        except Exception:
+            pass
+
+    # 2. Fetch from AniList if not in DB
+    if anilist_id:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post("https://graphql.anilist.co", json={
+                    "query": "query($id: Int) { Media(id: $id, type: ANIME) { idMal } }",
+                    "variables": {"id": anilist_id}
+                })
+                if r.status_code == 200:
+                    id_mal = r.json().get("data", {}).get("Media", {}).get("idMal")
+                    if id_mal:
+                        val = int(id_mal)
+                        _mal_id_cache[anilist_id] = val
+                        try:
+                            await execute_sql("UPDATE anime SET mal_id = ? WHERE anilist_id = ?", [val, anilist_id])
+                            log_message(f"Populated missing mal_id={val} for AniList ID {anilist_id} in anime table.")
+                        except Exception:
+                            pass
+                        return val
+        except Exception as e:
+            log_message(f"Failed to fetch idMal from AniList for {anilist_id}: {e}")
+
+    return None
+
+def detect_quality(filename: str) -> str:
+    if not filename:
+        return "1080p"
+    fn = filename.lower()
+    if "2160" in fn or "4k" in fn:
+        return "2160p"
+    if "1080" in fn:
+        return "1080p"
+    if "720" in fn:
+        return "720p"
+    if "480" in fn:
+        return "480p"
+    return "1080p"
+
+def build_telegram_metadata(
+    anilist_id: int,
+    id_mal: int,
+    ep_id: int,
+    ep_num: int,
+    filename: str,
+    subs_found: str = "",
+    audio_found: str = "",
+    duration: int = 0,
+    size_mb: float = 0.0,
+    pixeldrain_id: str = ""
+) -> tuple:
+    quality = detect_quality(filename)
+    safe_name = f"AL{anilist_id or 0}_EP{ep_num}_{quality}.mkv"
+    meta = {
+        "id_anilist": anilist_id,
+        "id_mal": id_mal,
+        "episode_id": ep_id,
+        "episode_number": ep_num,
+        "quality": quality,
+        "subtitles": [s.strip() for s in subs_found.split(",") if s.strip()] if subs_found else [],
+        "audio_tracks": [a.strip() for a in audio_found.split(",") if a.strip()] if audio_found else [],
+        "duration": int(duration or 0),
+        "file_size_mb": float(size_mb or 0.0),
+        "pixeldrain_id": pixeldrain_id or ""
+    }
+    caption = json.dumps(meta, indent=2, ensure_ascii=False)
+    return safe_name, caption
+
 async def cleanup_pixeldrain_duplicates():
     if not PIXELDRAIN_API_KEY:
         return
@@ -1347,6 +1533,7 @@ query ($page: Int, $airingAt_greater: Int, $airingAt_lesser: Int) {
       airingAt
       media {
         id
+        idMal
         title { romaji english native }
         synonyms
         episodes
@@ -1392,6 +1579,7 @@ async def sync_anilist_schedule():
                 for item in schedules:
                     m = item["media"]
                     anilist_id = m["id"]
+                    id_mal = m.get("idMal")
                     if anilist_id in blacklisted:
                         continue
 
@@ -1416,15 +1604,16 @@ async def sync_anilist_schedule():
 
                     batch_stmts.append(("""
                         INSERT INTO anime (anilist_id, title_romaji, title_english, title_native, synonyms, 
-                                           cover_url, banner_url, synopsis, genres, format, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RELEASING')
+                                           cover_url, banner_url, synopsis, genres, format, status, mal_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RELEASING', ?)
                         ON CONFLICT(anilist_id) DO UPDATE SET
                             title_romaji = excluded.title_romaji,
                             title_english = excluded.title_english,
                             synonyms = excluded.synonyms,
                             cover_url = CASE WHEN anime.cover_url IS NULL OR anime.cover_url = '' THEN excluded.cover_url ELSE anime.cover_url END,
+                            mal_id = CASE WHEN anime.mal_id IS NULL OR anime.mal_id = 0 THEN excluded.mal_id ELSE anime.mal_id END,
                             status = 'RELEASING'
-                    """, [anilist_id, romaji, english, native, synonyms, cover_url, banner_url, synopsis, genres, format_type]))
+                    """, [anilist_id, romaji, english, native, synonyms, cover_url, banner_url, synopsis, genres, format_type, id_mal]))
 
                 if batch_stmts:
                     await execute_sql_batch(batch_stmts)
@@ -1821,6 +2010,24 @@ async def resolve_pending_episodes():
                         WHERE id = ?
                     """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, is_multi_audio, audio_score, subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, int(time.time()), ep_id])
 
+                # Telegram backup upload (anonymized metadata JSON, no anime title to avoid DMCA)
+                id_mal = await get_mal_id(anime_id=anime_id, anilist_id=anilist_id)
+                safe_name, tg_caption = build_telegram_metadata(
+                    anilist_id=anilist_id,
+                    id_mal=id_mal,
+                    ep_id=ep_id,
+                    ep_num=ep_num,
+                    filename=v_name,
+                    subs_found=subs_found,
+                    audio_found=audio_found,
+                    duration=duration_found,
+                    size_mb=size_mb,
+                    pixeldrain_id=pd_id
+                )
+                tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+                if tg_data:
+                    await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep_id])
+
                 # Store parsed erai_title for future searches
                 parsed_erai = parse_erai_anime_title(v_name)
                 if parsed_erai and not erai_title:
@@ -1845,7 +2052,7 @@ async def check_pending_reviews():
     log_message("Checking pending reviews (non-CR grace period)...")
     pending = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.pixeldrain_1080_url, e.subtitles, e.audio_tracks,
-               e.pending_review_until, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
+               e.pending_review_until, a.anilist_id, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'ready' AND e.pending_review_until > 0
@@ -1936,6 +2143,25 @@ async def check_pending_reviews():
                         uploaded_at = ?, pending_review_until = 0 
                     WHERE id = ?
                 """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, now_str, ep_id])
+
+                # Telegram backup upload (anonymized metadata JSON, no anime title to avoid DMCA)
+                id_mal = await get_mal_id(anime_id=ep["anime_id"], anilist_id=ep.get("anilist_id"))
+                safe_name, tg_caption = build_telegram_metadata(
+                    anilist_id=ep.get("anilist_id") or 0,
+                    id_mal=id_mal,
+                    ep_id=ep_id,
+                    ep_num=ep_num,
+                    filename=v_name,
+                    subs_found=subs_found,
+                    audio_found=audio_found,
+                    duration=duration_found,
+                    size_mb=size_mb,
+                    pixeldrain_id=pd_id
+                )
+                tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+                if tg_data:
+                    await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep_id])
+
                 log_message(f"Grace: replaced {romaji} Ep {ep_num} with CR Arabic version (Subs: {subs_found})")
             except Exception as e:
                 log_message(f"Grace: failed to replace {romaji} Ep {ep_num}: {e}")
@@ -1949,7 +2175,7 @@ async def check_audio_upgrades():
     successful_upgrades = 0
     recent_eps = await execute_sql("""
         SELECT e.id as ep_id, e.anime_id, e.episode_number, e.pixeldrain_id, e.audio_score, e.uploaded_at, e.subtitles, e.audio_tracks,
-               a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
+               a.anilist_id, a.title_romaji, a.title_english, a.synonyms, a.format, a.erai_title
         FROM episodes e
         JOIN anime a ON e.anime_id = a.id
         WHERE e.status = 'ready' 
@@ -2025,6 +2251,24 @@ async def check_audio_upgrades():
                         WHERE id = ?
                     """, [pd_url, pd_id, pd_url, pd_id, size_mb, stored_source, new_score, subs_found, audio_found, subs_found, audio_found, skip_times_found, duration_found, duration_found, ep["ep_id"]])
 
+                    # Telegram backup upload (anonymized metadata JSON, no anime title to avoid DMCA)
+                    id_mal = await get_mal_id(anime_id=ep["anime_id"], anilist_id=ep.get("anilist_id"))
+                    safe_name, tg_caption = build_telegram_metadata(
+                        anilist_id=ep.get("anilist_id") or 0,
+                        id_mal=id_mal,
+                        ep_id=ep["ep_id"],
+                        ep_num=ep_num,
+                        filename=v_name,
+                        subs_found=subs_found,
+                        audio_found=audio_found,
+                        duration=duration_found,
+                        size_mb=size_mb,
+                        pixeldrain_id=pd_id
+                    )
+                    tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+                    if tg_data:
+                        await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep["ep_id"]])
+
                     log_message(f"Successfully upgraded {romaji} Ep {ep_num} audio.")
                     upgrade_success = True
                     successful_upgrades += 1
@@ -2041,32 +2285,6 @@ async def check_audio_upgrades():
             if not upgrade_success:
                 log_message(f"All audio upgrade candidates failed for {romaji} Ep {ep_num}. Marking audio_upgrade_failed = 1 to prevent re-attempts.")
                 await execute_sql("UPDATE episodes SET audio_upgrade_failed = 1 WHERE id = ?", [ep["ep_id"]])
-
-# ─── Schema Maintenance ────────────────────────────────────────
-async def ensure_database_schema():
-    try:
-        existing_cols = await execute_sql("PRAGMA table_info(episodes)")
-        existing = {row["name"] for row in existing_cols or []}
-        columns = {
-            "duration": "INTEGER",
-            "subtitles": "TEXT",
-            "audio_tracks": "TEXT",
-            "subtitles_1080": "TEXT",
-            "audio_tracks_1080": "TEXT",
-            "pixeldrain_1080_url": "TEXT",
-            "pixeldrain_1080_id": "TEXT",
-            "mirror_720_missing": "INTEGER NOT NULL DEFAULT 0",
-            "mirror_480_missing": "INTEGER NOT NULL DEFAULT 0",
-            "mirror_updated_at": "INTEGER",
-            "pending_review_until": "INTEGER NOT NULL DEFAULT 0",
-            "audio_upgrade_failed": "INTEGER NOT NULL DEFAULT 0",
-        }
-        for name, col_type in columns.items():
-            if name not in existing:
-                await execute_sql(f"ALTER TABLE episodes ADD COLUMN {name} {col_type}")
-                log_message(f"Added column '{name}' to episodes table.")
-    except Exception as e:
-        log_message(f"Schema maintenance notice: {e}")
 
 # ─── Main Entry Point ──────────────────────────────────────────
 async def main():
