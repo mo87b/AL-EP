@@ -41,5 +41,9 @@ jobs:
           GAS_PROXY_URL: ${{ secrets.GAS_PROXY_URL || secrets.RELAY_URL }}
           GAS_PROXY_URL_2: ${{ secrets.GAS_PROXY_URL_2 || secrets.RELAY_URL_2 }}
           GAS_PROXY_URL_3: ${{ secrets.GAS_PROXY_URL_3 || secrets.RELAY_URL_3 }}
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
         run: |
           python sync_job.py
