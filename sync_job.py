@@ -1385,7 +1385,7 @@ def delete_from_pixeldrain(file_id: str) -> bool:
 def is_telegram_configured() -> bool:
     return bool(TELEGRAM_API_ID and TELEGRAM_API_HASH and TELEGRAM_BOT_TOKEN and TELEGRAM_CHANNEL_ID)
 
-async def upload_to_telegram(file_path: str, filename: str = None, caption: str = "") -> dict:
+async def upload_to_telegram(file_path: str, filename: str = None, caption: str = "", duration: int = None) -> dict:
     if not is_telegram_configured():
         log_message("Telegram backup: credentials not configured, skipping.")
         return None
@@ -1402,12 +1402,27 @@ async def upload_to_telegram(file_path: str, filename: str = None, caption: str 
         log_message(f"Telegram backup skipped: file size ({round(file_size / 1048576, 2)} MB) exceeds 2GB limit.")
         return None
 
+    upload_timeout = max(300, int((file_size / 1048576) * 3) + 180)
+
     try:
         import pyrogram.utils
         pyrogram.utils.MIN_CHANNEL_ID = -10099999999999
         from pyrogram import Client
 
-        log_message(f"Telegram backup: uploading {target_name} ({round(file_size / 1048576, 2)} MB)...")
+        total_mb = round(file_size / 1048576, 2)
+        log_message(f"Telegram backup: uploading {target_name} ({total_mb} MB)...")
+
+        last_logged_time = [0.0]
+        last_logged_pct = [-1]
+
+        def upload_progress(current, total):
+            now = time.time()
+            pct = int((current / total) * 100) if total else 0
+            if pct >= last_logged_pct[0] + 10 or (now - last_logged_time[0]) >= 30 or current == total:
+                last_logged_time[0] = now
+                last_logged_pct[0] = pct
+                cur_mb = round(current / 1048576, 2)
+                log_message(f"Telegram backup progress: {pct}% ({cur_mb} / {total_mb} MB)")
 
         async with Client(
             "telegram_backup_session",
@@ -1416,25 +1431,39 @@ async def upload_to_telegram(file_path: str, filename: str = None, caption: str 
             bot_token=TELEGRAM_BOT_TOKEN,
             in_memory=True
         ) as app:
-            is_video = target_name.lower().endswith((".mp4", ".mkv", ".webm", ".avi", ".mov"))
-            if is_video:
-                msg = await app.send_video(
-                    chat_id=TELEGRAM_CHANNEL_ID,
-                    video=file_path,
-                    caption=caption or target_name,
-                    file_name=target_name,
-                    supports_streaming=True
-                )
-                media = msg.video or msg.document or msg.animation
-            else:
-                msg = await app.send_document(
-                    chat_id=TELEGRAM_CHANNEL_ID,
-                    document=file_path,
-                    caption=caption or target_name,
-                    file_name=target_name
-                )
-                media = msg.document
+            ext = os.path.splitext(target_name)[1].lower()
+            is_mp4 = ext == ".mp4"
 
+            async def _send_media():
+                # MKV and large video containers sent as documents avoid Telegram server-side video indexing stalls,
+                # ensuring instant RPC response while remaining fully playable on Telegram clients.
+                if is_mp4:
+                    return await app.send_video(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        video=file_path,
+                        caption=caption or target_name,
+                        file_name=target_name,
+                        duration=duration or 0,
+                        supports_streaming=True,
+                        progress=upload_progress
+                    )
+                else:
+                    return await app.send_document(
+                        chat_id=TELEGRAM_CHANNEL_ID,
+                        document=file_path,
+                        caption=caption or target_name,
+                        file_name=target_name,
+                        force_document=True,
+                        progress=upload_progress
+                    )
+
+            msg = await asyncio.wait_for(_send_media(), timeout=upload_timeout)
+
+            if not msg:
+                log_message(f"Telegram backup failed: no confirmation returned for {target_name}")
+                return None
+
+            media = msg.video or msg.document or msg.animation
             media_file_id = getattr(media, "file_id", "")
             log_message(f"Telegram backup: successfully uploaded (message_id={msg.id})")
             return {
@@ -1444,6 +1473,9 @@ async def upload_to_telegram(file_path: str, filename: str = None, caption: str 
                 "file_name": target_name,
                 "file_id": media_file_id,
             }
+    except asyncio.TimeoutError:
+        log_message(f"Telegram backup timed out after {upload_timeout}s for {target_name}")
+        return None
     except Exception as e:
         log_message(f"Telegram backup failed for {target_name}: {e}")
         return None
@@ -2095,7 +2127,7 @@ async def resolve_pending_episodes():
                     size_mb=size_mb,
                     pixeldrain_id=pd_id
                 )
-                tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+                tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption, duration=duration_found)
                 if tg_data:
                     await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep_id])
 
@@ -2229,7 +2261,7 @@ async def check_pending_reviews():
                     size_mb=size_mb,
                     pixeldrain_id=pd_id
                 )
-                tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+                tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption, duration=duration_found)
                 if tg_data:
                     await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep_id])
 
@@ -2336,7 +2368,7 @@ async def check_audio_upgrades():
                         size_mb=size_mb,
                         pixeldrain_id=pd_id
                     )
-                    tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption)
+                    tg_data = await upload_to_telegram(v_path, filename=safe_name, caption=tg_caption, duration=duration_found)
                     if tg_data:
                         await execute_sql("UPDATE episodes SET telegram_file_id = ?, telegram_message_id = ? WHERE id = ?", [tg_data.get("file_id"), tg_data.get("message_id"), ep["ep_id"]])
 
