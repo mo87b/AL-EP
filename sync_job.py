@@ -360,6 +360,36 @@ def is_blacklisted_platform(title: str) -> bool:
         return False
     return bool(re.search(r'\b(nf|netflix|iq|iqiyi)\b', title.lower()))
 
+def is_rejected_foreign_torrent(title: str) -> bool:
+    """Rejects torrents with foreign non-English/non-Arabic subtitles, dubs, or foreign-only release groups (e.g. Tsundere-Raws, SUBFRENCH, VOSTFR)."""
+    if not title or not isinstance(title, str):
+        return False
+    t_lower = title.lower()
+
+    # Trusted multi-sub release groups are never rejected
+    is_trusted = bool(re.search(r'\[?(erai[-_ ]?raws|toonshub)\]?|\bvaryg\b', t_lower))
+    if is_trusted:
+        return False
+
+    # 1. Foreign-only subtitle tags (French, Italian, Spanish, German, Russian, Portuguese, Polish, etc.)
+    foreign_sub_pattern = (
+        r'\b(subfrench|sub[-_ ]?french|sub[-_ ]?fr|vostfr|vff?|'
+        r'subita|sub[-_ ]?ita|vostit|ita[-_ ]?sub|'
+        r'subesp|sub[-_ ]?esp|vostes|esp[-_ ]?sub|castellano|'
+        r'subger|sub[-_ ]?ger|ger[-_ ]?sub|german[-_ ]?sub|'
+        r'subrus|sub[-_ ]?rus|rus[-_ ]?sub|'
+        r'subpor|sub[-_ ]?por|por[-_ ]?sub|pt[-_ ]?br|'
+        r'subpl|sub[-_ ]?pl)\b'
+    )
+    if re.search(foreign_sub_pattern, t_lower):
+        return True
+
+    # 2. Foreign-only fansub groups (e.g. Tsundere-Raws, Rapta, etc.)
+    if re.search(r'\b(tsundere[-_ ]?raws|tsundere|rapta)\b', t_lower):
+        return True
+
+    return False
+
 def get_audio_score(title: str) -> int:
     """
     Score hierarchy:
@@ -507,6 +537,8 @@ def get_clean_words(title: str) -> list:
 
 def is_matching_torrent(torrent_title: str, romaji: str, english: str, ep: int, synonyms: list = None, is_special: bool = False) -> bool:
     if not torrent_title or not romaji:
+        return False
+    if is_rejected_foreign_torrent(torrent_title):
         return False
     t_lower = torrent_title.lower()
     synonyms = synonyms or []
@@ -947,7 +979,7 @@ def _parse_nyaa_rss_body(text: str, content: bytes, romaji: str, english: str, e
         torrent_url = item["torrent"]
         seeders = item["seeders"]
         pub_date = item.get("pub_date", 0)
-        if not t or not torrent_url:
+        if not t or not torrent_url or is_rejected_foreign_torrent(t):
             continue
 
         if is_matching_torrent(t, romaji, english, ep, synonyms=synonyms, is_special=is_special):
@@ -966,8 +998,8 @@ async def search_nyaa_rss(query: str, romaji: str, english: str, ep: int, synony
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     tag = query[:40].replace("\n", " ")
 
-    # 1. Fast Path: Direct Nyaa RSS attempt (sub-second response)
-    direct_url = f"https://nyaa.si/?page=rss&q={encoded_query}"
+    # 1. Fast Path: Direct Nyaa RSS attempt (sub-second response, category 1_2 = Anime - English-translated)
+    direct_url = f"https://nyaa.si/?page=rss&q={encoded_query}&c=1_2"
     try:
         async with httpx.AsyncClient(trust_env=False, timeout=3.5, headers=headers, follow_redirects=True) as client:
             r = await client.get(direct_url)
@@ -1900,6 +1932,8 @@ async def resolve_pending_episodes():
         tier3_only = (aired_at > 0) and (now_ts - aired_at < 600)
 
         def is_acceptable_torrent(t_title: str) -> bool:
+            if is_rejected_foreign_torrent(t_title):
+                return False
             if tier3_only:
                 return get_platform_score(t_title) >= 3
             return True
