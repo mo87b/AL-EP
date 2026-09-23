@@ -2337,7 +2337,7 @@ async def check_audio_upgrades():
         is_special = ep.get("format") in ["SPECIAL", "MOVIE", "OVA", "ONA"]
         queries = get_search_queries(romaji, english, ep_num, synonyms=synonyms, is_special=is_special, erai_title=erai_title)
         better = []
-        for i in range(0, min(len(queries), 4), 4):
+        for i in range(0, min(len(queries), 12), 4):
             batch = queries[i:i+4]
             tasks = [search_nyaa_rss(q, romaji, english, ep_num, synonyms=synonyms, is_special=is_special) for q in batch]
             batch_res = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2350,7 +2350,7 @@ async def check_audio_upgrades():
                         min_s = get_min_seeders_for_torrent(r["title"])
                         if get_audio_score(r["title"]) > current_audio and r.get("seeders", 0) >= min_s:
                             better.append(r)
-            if better:
+            if any(get_audio_score(r["title"]) >= 4 for r in better):
                 break
 
         if better:
